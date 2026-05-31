@@ -1,0 +1,31 @@
+{
+  "_from_model_config": true,
+  "begin_suppress_tokens": [
+    220,
+    50257
+  ],
+  "bos_token_id": 50257,
+  "decoder_start_token_id": 50258,
+  "eos_token_id": 50257,
+  "forced_decoder_ids": [
+    [
+      1,
+      50272
+    ],
+    [
+      2,
+      50359
+    ],
+    [
+      3,
+      50363
+    ]
+  ],
+  "language": null,
+  "output_attentions": false,
+  "output_hidden_states": false,
+  "pad_token_id": 50257,
+  "task": null,
+  "transformers_version": "5.7.0",
+  "use_cache": false
+}

@@ -1,0 +1,59 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── Large model binaries (keep out of git — download via HuggingFace) ─────────
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+*.onnx
+*.msgpack
+*.h5
+
+# ── Exception: the small LoRA adapter (only ~2.4 MB — safe to commit) ─────────
+!whisper-base-quran-lora/adapter_model.safetensors
+
+# ── HuggingFace / model caches ─────────────────────────────────────────────────
+.cache/
+*/.cache/
+*/runs/
+
+# ── Dataset & large data files ────────────────────────────────────────────────
+data/transcripts.tsv
+
+# ── Runtime session data (generated at runtime, not source code) ───────────────
+recordings/
+audio_cache/
+
+# ── OS & editor artefacts ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs & temp ───────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp

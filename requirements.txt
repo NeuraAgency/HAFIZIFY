@@ -1,0 +1,16 @@
+torch>=2.2.0
+torchvision
+torchaudio
+transformers
+datasets
+accelerate
+peft
+soundfile
+librosa
+evaluate
+pandas
+numpy<2.3.0
+gradio
+pyctcdecode
+rapidfuzz
+silero-vad>=5.0
