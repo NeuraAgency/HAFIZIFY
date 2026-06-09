@@ -27,6 +27,9 @@ env/
 # ── Exception: the small LoRA adapter (only ~2.4 MB — safe to commit) ─────────
 !whisper-base-quran-lora/adapter_model.safetensors
 
+# ── Exception: CT2 model binary (76 MB — converted LoRA, safe under 100 MB limit)
+!whisper-base-quran-lora-ct2/model.bin
+
 # ── HuggingFace / model caches ─────────────────────────────────────────────────
 .cache/
 */.cache/
