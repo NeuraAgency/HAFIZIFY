@@ -4,6 +4,28 @@ import queue
 import threading
 from typing import Optional
 
+# Load .env file if present
+_env_path = os.path.join(os.path.dirname(__file__), ".env")
+try:
+    from dotenv import load_dotenv
+    if os.path.isfile(_env_path):
+        load_dotenv(_env_path, override=True)
+    else:
+        load_dotenv()
+except ImportError:
+    if os.path.isfile(_env_path):
+        try:
+            with open(_env_path, "r", encoding="utf-8") as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        _k, _v = _k.strip(), _v.strip().strip("'\"")
+                        if _k and _k not in os.environ:
+                            os.environ[_k] = _v
+        except Exception:
+            pass
+
 # Ensure we can import from fyp_model
 sys.path.append(os.path.join(os.path.dirname(__file__), "fyp_model"))
 
@@ -31,6 +53,8 @@ from surah_detector import SurahDetector
 # ---------------------------------------------------------------------------
 
 import librosa
+from math import gcd
+from scipy.signal import butter, filtfilt, resample_poly
 
 def load_audio_16k(path: str) -> np.ndarray:
     wav, sr = librosa.load(path, sr=16000, mono=True)
@@ -729,18 +753,40 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode):
 
     sr, audio_np = audio_data
 
-    # Convert to float32 if integer
-    if audio_np.dtype in (np.int16, np.int32):
-        audio_np = audio_np.astype(np.float32) / np.iinfo(audio_np.dtype).max
+    # ── Step 1: Ensure float32 in [-1, 1] — handle ALL Gradio formats ────
+    if audio_np.dtype == np.int16:
+        audio_np = audio_np.astype(np.float32) / 32768.0
+    elif audio_np.dtype == np.int32:
+        audio_np = audio_np.astype(np.float32) / 2147483648.0
     elif audio_np.dtype == np.uint8:
         audio_np = (audio_np.astype(np.float32) - 128.0) / 128.0
+    else:
+        audio_np = audio_np.astype(np.float32)
+        # Normalize if values exceed [-1, 1]
+        max_val = np.max(np.abs(audio_np))
+        if max_val > 1.0:
+            audio_np = audio_np / max_val
 
-    # Ensure mono
-    if audio_np.ndim > 1:
-        audio_np = audio_np.mean(axis=1) if audio_np.shape[0] > audio_np.shape[1] else audio_np.mean(axis=0)
+    # ── Step 2: Mono conversion ───────────────────────────────────────────
+    if audio_np.ndim == 2:
+        audio_np = audio_np.mean(axis=1)
+    elif audio_np.ndim > 2:
+        audio_np = audio_np[:, 0]
 
-    # Resample to 16kHz
-    audio_16k = resample_to_16k(audio_np, sr)
+    # ── Step 3: Resample to 16kHz using scipy (more accurate for streaming)
+    if sr != 16000:
+        g = gcd(16000, sr)
+        audio_np = resample_poly(audio_np, 16000 // g, sr // g).astype(np.float32)
+
+    # ── Step 4: Skip pure silence ──────────────────────────────────────────
+    # NOTE: Amplitude normalization and high-pass filtering are intentionally
+    # NOT done here.  They are applied per-chunk in _emit_segment() after VAD
+    # assembles a full speech segment.  Applying them per-fragment causes gain
+    # pumping and filtfilt edge transients → choppy audio.
+    if np.max(np.abs(audio_np)) < 0.001:
+        return no_update  # pure silence, skip
+
+    audio_16k = audio_np
 
     # Gradio streaming mode differs by version:
     #   - Gradio 3.x: cumulative (each call receives the full buffer from start)

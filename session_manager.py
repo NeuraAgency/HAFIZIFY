@@ -84,9 +84,9 @@ SAMPLE_RATE = 16000
 # are detected as split points, so a 19-minute session gets broken into
 # individual ayah-length chunks instead of one giant speech segment that
 # exceeds Whisper's 30-second window.
-_VAD_MIN_SILENCE_MS      = 100     # was 300 — split on short ayah-boundary pauses
-_VAD_MIN_SPEECH_MS       = 150     # was 200 — catch short ayahs (e.g. Al-Fatiha verses)
-_VAD_THRESHOLD           = 0.35    # was 0.30 — slightly more sensitive for quiet recitation
+_VAD_MIN_SILENCE_MS      = 400     # ayah ke beech proper pause
+_VAD_MIN_SPEECH_MS       = 200     # short ayahs bhi pakad
+_VAD_THRESHOLD           = 0.25    # zyada sensitive — soft consonants miss na hon
 _VAD_END_PAD_MS          = 80      # OK — keep as is
 _VAD_MIN_CHUNK_DURATION  = 2.0     # was 0.3 — 2s minimum ensures Whisper has enough context
 _VAD_MAX_CHUNK_DURATION  = 8.0     # safety net — split any segment longer than 8s
@@ -174,7 +174,7 @@ class RecitationSession:
                 print(f"[Session {self.session_id}] ⚠️ VAD init failed ({e}); falling back to fixed-time")
                 self.use_vad = False
 
-        self._processed_vad_segments: Set[str] = set()
+
 
         # Audio accumulation
         self._buffer = np.array([], dtype=np.float32)
@@ -283,13 +283,22 @@ class RecitationSession:
         end_pad = int(_VAD_END_PAD_MS / 1000 * SAMPLE_RATE)
         padded_end = min(total_len, abs_end + end_pad)
         chunk_audio = self._all_audio[abs_start:padded_end].copy()
+        chunk_audio = _apply_fade(chunk_audio, fade_ms=10)
 
         if len(chunk_audio) < int(_VAD_MIN_CHUNK_DURATION * SAMPLE_RATE):
             return None
 
-        # Peak-normalise quiet audio so ASR doesn't fail
+        # High-pass filter — remove DC offset & low-freq rumble (safe on full chunk)
+        if len(chunk_audio) > 20:
+            from scipy.signal import butter, filtfilt
+            b, a = butter(2, 80.0 / (SAMPLE_RATE / 2), btype='high')
+            chunk_audio = filtfilt(b, a, chunk_audio).astype(np.float32)
+
+        # Peak-normalise: cap near-clipping, boost quiet audio
         max_amp = np.max(np.abs(chunk_audio))
-        if 0 < max_amp < 0.9:
+        if max_amp > 0.8:
+            chunk_audio = chunk_audio * (0.7 / max_amp)
+        elif 0 < max_amp < 0.9:
             chunk_audio = chunk_audio * (0.9 / max_amp)
 
         # Save WAV for debugging
@@ -304,54 +313,65 @@ class RecitationSession:
 
         return chunk_audio, abs_start, padded_end
 
-    def _process_vad_timestamps(
+    def _merge_and_emit(
         self,
         timestamps: List[Dict[str, int]],
         window_start: int,
         total_len: int,
-        tail_confirm_samples: int,
-        label: str = "vad",
+        tail_confirm: int,
     ) -> List[Tuple[np.ndarray, int, int]]:
-        """Convert VAD timestamps into ready chunks.
+        """Merge adjacent VAD segments into chunks and emit confirmed ones.
 
-        Each VAD segment becomes its own chunk — NO merging.
-        Segments are only emitted once their trailing silence is confirmed.
-        Long segments are automatically split.
+        Adjacent segments are merged until the group meets
+        _VAD_MIN_CHUNK_DURATION.  This prevents short speech bursts
+        from being discarded, which was the main cause of choppy audio.
         """
-        ready_chunks = []
+        min_dur = int(_VAD_MIN_CHUNK_DURATION * SAMPLE_RATE)
+        pre_pad = int(0.15 * SAMPLE_RATE)
 
-        for seg in timestamps:
-            abs_start = max(0, window_start + seg["start"] - int(0.2 * SAMPLE_RATE))
-            abs_end   = window_start + seg["end"]
+        # ── Build groups by merging short segments with the next one ──
+        groups: List[Tuple[int, int]] = []
+        g_start = timestamps[0]["start"]
+        g_end   = timestamps[0]["end"]
 
-            # Require trailing silence before emitting (avoid clipping active speech)
-            if abs_end + tail_confirm_samples > total_len:
-                continue
+        for seg in timestamps[1:]:
+            if (g_end - g_start) >= min_dur:
+                # Current group is long enough → finalise it
+                groups.append((g_start, g_end))
+                g_start = seg["start"]
+            # Extend (or start) the running group
+            g_end = seg["end"]
+        groups.append((g_start, g_end))  # last group
 
-            seg_id = f"{window_start + seg['start']}_{window_start + seg['end']}"
-            if seg_id in self._processed_vad_segments:
-                continue
+        # ── Emit groups whose trailing silence is confirmed ───────────
+        ready: List[Tuple[np.ndarray, int, int]] = []
 
-            result = self._emit_segment(abs_start, abs_end, total_len, label)
+        for g_s, g_e in groups:
+            abs_end = window_start + g_e
 
-            self._processed_vad_segments.add(seg_id)
-            self._vad_segment_counter += 1
+            # Still speaking or not enough silence yet → stop here
+            if abs_end + tail_confirm > total_len:
+                break
+
+            abs_start = max(self._vad_committed_up_to,
+                            window_start + g_s - pre_pad)
+
+            result = self._emit_segment(abs_start, abs_end, total_len, "vad")
             self._vad_committed_up_to = abs_end
+            self._vad_segment_counter += 1
 
             if result is None:
-                continue
+                continue  # too short even after merge — skip, audio consumed
 
             chunk_audio, padded_start, padded_end = result
-
-            # Split if > max chunk duration (Whisper hard limit protection)
             pieces = self._split_long_segment(chunk_audio, padded_start)
-            for piece_audio, piece_start, piece_end in pieces:
-                ready_chunks.append((piece_audio, piece_start, piece_end))
-                print(f"[VAD] Emitting chunk: "
-                      f"{piece_start/SAMPLE_RATE:.1f}s–{piece_end/SAMPLE_RATE:.1f}s "
-                      f"({len(piece_audio)/SAMPLE_RATE:.2f}s)")
+            for p_audio, p_start, p_end in pieces:
+                ready.append((p_audio, p_start, p_end))
+                print(f"[VAD] Emitting: "
+                      f"{p_start/SAMPLE_RATE:.1f}s–{p_end/SAMPLE_RATE:.1f}s "
+                      f"({len(p_audio)/SAMPLE_RATE:.2f}s)")
 
-        return ready_chunks
+        return ready
 
     # ----------------------------------------------------------------
     # Audio feeding
@@ -373,7 +393,7 @@ class RecitationSession:
 
         # Append to buffer and full session recording
         self._buffer = np.concatenate([self._buffer, audio_fragment])
-        self._all_audio = np.concatenate([self._all_audio, _apply_fade(audio_fragment)])
+        self._all_audio = np.concatenate([self._all_audio, audio_fragment])
         self._total_samples_fed += len(audio_fragment)
 
         if self.use_vad and self._vad_model is not None:
@@ -382,35 +402,31 @@ class RecitationSession:
         return self._feed_audio_fixed()
 
     def _feed_audio_vad(self) -> List[tuple]:
-        """Incremental VAD path — scans only the uncommitted tail.
+        """VAD-based chunking with automatic segment merging.
 
-        Re-runs every _VAD_RESCAN_INTERVAL seconds (150ms by default).
-        Splits on ANY silence >= _VAD_MIN_SILENCE_MS (100ms).
-        Each speech segment becomes its own independent chunk.
+        Runs VAD on the uncommitted audio window, merges adjacent short
+        segments so that each emitted chunk meets _VAD_MIN_CHUNK_DURATION,
+        and only emits chunks whose trailing silence is confirmed.
         """
         total_len = len(self._all_audio)
 
         # Throttle: don't re-run VAD unless enough new audio arrived
-        new_audio = total_len - self._vad_scanned_up_to
-        if new_audio < self._vad_min_new_samples:
+        if total_len - self._vad_scanned_up_to < self._vad_min_new_samples:
             return []
-
         self._vad_scanned_up_to = total_len
 
         window_start = self._vad_committed_up_to
-        window_audio = self._all_audio[window_start:]
+        window = self._all_audio[window_start:]
 
-        if len(window_audio) < int(0.2 * SAMPLE_RATE):
+        if len(window) < int(0.5 * SAMPLE_RATE):
             return []
 
-        timestamps = self._run_vad_on_window(window_audio)
+        timestamps = self._run_vad_on_window(window)
         if not timestamps:
             return []
 
-        tail_confirm = int(_VAD_TAIL_CONFIRM * SAMPLE_RATE)
-        return self._process_vad_timestamps(
-            timestamps, window_start, total_len, tail_confirm, label="vad"
-        )
+        return self._merge_and_emit(timestamps, window_start, total_len,
+                                    tail_confirm=int(_VAD_TAIL_CONFIRM * SAMPLE_RATE))
 
     def _feed_audio_fixed(self) -> List[tuple]:
         """Fixed-time chunking fallback (used when VAD is unavailable)."""
@@ -442,39 +458,35 @@ class RecitationSession:
             if len(window_audio) >= int(0.2 * SAMPLE_RATE):
                 timestamps = self._run_vad_on_window(window_audio)
                 if timestamps:
-                    # On flush, no tail confirmation needed — session is ending
-                    chunks = self._process_vad_timestamps(
-                        timestamps, window_start, total_len,
-                        tail_confirm_samples=0,   # emit everything
-                        label="vad_final",
+                    # On flush, no tail confirmation needed — session ending
+                    remaining_chunks.extend(
+                        self._merge_and_emit(
+                            timestamps, window_start, total_len,
+                            tail_confirm=0,
+                        )
                     )
-                    remaining_chunks.extend(chunks)
 
-            # Safety net: emit anything VAD missed (e.g. user still speaking on Stop)
+            # Safety net: emit anything VAD missed
             leftover_start = self._vad_committed_up_to
             leftover_audio = self._all_audio[leftover_start:]
 
             if len(leftover_audio) >= int(0.3 * SAMPLE_RATE):
-                seg_id = f"{leftover_start}_{len(self._all_audio)}"
-                if seg_id not in self._processed_vad_segments:
-                    result = self._emit_segment(
-                        leftover_start,
-                        len(self._all_audio),
-                        len(self._all_audio),
-                        label="vad_tail",
-                    )
-                    self._processed_vad_segments.add(seg_id)
-                    self._vad_segment_counter += 1
-                    self._vad_committed_up_to = len(self._all_audio)
+                result = self._emit_segment(
+                    leftover_start,
+                    len(self._all_audio),
+                    len(self._all_audio),
+                    label="vad_tail",
+                )
+                self._vad_segment_counter += 1
+                self._vad_committed_up_to = len(self._all_audio)
 
-                    if result is not None:
-                        chunk_audio, padded_start, padded_end = result
-                        pieces = self._split_long_segment(chunk_audio, padded_start)
-                        for piece_audio, piece_start, piece_end in pieces:
-                            remaining_chunks.append((piece_audio, piece_start, piece_end))
-                        print(f"[Session] Safety-net: flushed "
-                              f"{len(leftover_audio)/SAMPLE_RATE:.1f}s of tail audio "
-                              f"→ {len(pieces)} piece(s)")
+                if result is not None:
+                    chunk_audio, padded_start, padded_end = result
+                    pieces = self._split_long_segment(chunk_audio, padded_start)
+                    remaining_chunks.extend(pieces)
+                    print(f"[Session] Safety-net: flushed "
+                          f"{len(leftover_audio)/SAMPLE_RATE:.1f}s → "
+                          f"{len(pieces)} piece(s)")
         else:
             # Fixed-time: flush remainder
             remaining_start = self._next_chunk_start

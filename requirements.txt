@@ -20,3 +20,5 @@ edge-tts
 pygame
 faster-whisper
 groq
+python-dotenv
+scipy
