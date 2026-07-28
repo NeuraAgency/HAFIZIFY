@@ -30,6 +30,8 @@ import torch
 import torchaudio
 from typing import Optional, Dict, Any, List
 
+from quran_trie import QuranTrie
+
 # Ensure fyp_model is importable
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _FYP_DIR = os.path.join(_BASE_DIR, "fyp_model")
@@ -259,6 +261,8 @@ class RealtimeStreamer:
 
         # Optional viterbi pipeline for final session re-decode
         self._viterbi_pipeline = None
+        self._quran_trie: Optional[QuranTrie] = None
+        self._decode_context = {"surah": None, "ayah": None}  # updated before each decode
 
         # Beam search setting
         self._use_beam_realtime = False
@@ -489,6 +493,25 @@ class RealtimeStreamer:
             self._ayah_map = load_all_ayat_json(self.ayah_json_path)
             print(f"[RealtimeStreamer] Loaded {len(self._ayah_map)} ayahs")
 
+        # Build or load Quran prefix trie
+        if self._ayah_map and self._is_faster_whisper:
+            _tokenizer = getattr(self._model, 'hf_tokenizer', None)
+            if _tokenizer is None:
+                print("[RealtimeStreamer] hf_tokenizer not available — QuranTrie skipped")
+            else:
+                cached_trie = QuranTrie.load_cache()
+                if cached_trie is not None:
+                    self._quran_trie = cached_trie
+                else:
+                    try:
+                        trie = QuranTrie()
+                        trie.build(self._ayah_map, _tokenizer)
+                        trie.save_cache()
+                        self._quran_trie = trie
+                    except Exception as e:
+                        print(f"[RealtimeStreamer] Trie build failed: {e}")
+                        self._quran_trie = None
+
         if self._surah_detector is None and os.path.isfile(self.ayah_json_path):
             try:
                 self._surah_detector = SurahDetector(self.ayah_json_path)
@@ -520,17 +543,32 @@ class RealtimeStreamer:
         audio_np = np.concatenate([pad, audio_np])
         
         if self._is_faster_whisper:
-            segments, _ = self._model.transcribe(
-                audio_np,
+            # Build context-aware hotwords and initial_prompt
+            ctx_surah = self._decode_context.get("surah")
+            ctx_ayah = self._decode_context.get("ayah")
+
+            hotwords = None
+            initial_prompt = "بسم الله الرحمن الرحيم"
+
+            if self._quran_trie is not None:
+                hotwords = self._quran_trie.get_hotwords(ctx_surah, ctx_ayah) or None
+                initial_prompt = self._quran_trie.get_initial_prompt(ctx_surah, ctx_ayah, self._ayah_map or {})
+
+            transcribe_kwargs = dict(
                 language="ar",
-                beam_size=1,                    # deterministic, fastest on CPU/Pi 5
-                temperature=0.0,               # no sampling randomness
+                beam_size=1,
+                temperature=0.0,
                 repetition_penalty=1.3,
-                no_repeat_ngram_size=3,
-                condition_on_previous_text=False,  # prevent hallucination loops
-                without_timestamps=True,           # skip timestamp overhead
-                vad_filter=False,                  # Silero VAD already handles this upstream
+                condition_on_previous_text=False,
+                without_timestamps=True,
+                vad_filter=False,
+                initial_prompt=initial_prompt,
             )
+            if hotwords:
+                # faster-whisper expects hotwords as a comma-separated STRING, not a list
+                transcribe_kwargs["hotwords"] = ", ".join(hotwords[:100])
+
+            segments, _ = self._model.transcribe(audio_np, **transcribe_kwargs)
             return normalize_arabic(" ".join([s.text for s in segments]).strip())
         
         # Original whisper path (fallback)
@@ -678,6 +716,8 @@ class RealtimeStreamer:
         effective_surah = session.surah if session.surah is not None else lock_surah
         if session.surah is None and lock_surah is not None:
             session.surah = lock_surah
+        # Update decode context so _decode_chunk can use surah/ayah for constrained decoding on next chunk
+        self._decode_context = {"surah": effective_surah, "ayah": session.current_ayah}
         strip_basmala_for_analysis = not (
             effective_surah == 1 and (session.current_ayah is None or session.current_ayah <= 1)
         )

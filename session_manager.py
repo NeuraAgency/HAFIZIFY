@@ -59,6 +59,19 @@ except Exception as exc:
     print(f"[SessionManager] VAD not available ({exc}); falling back to fixed-time chunking.")
 
 
+def _apply_fade(audio: np.ndarray, fade_ms: int = 5, sample_rate: int = 16000) -> np.ndarray:
+    """Apply short fade-in and fade-out to avoid concatenation clicks."""
+    fade_samples = int(fade_ms * sample_rate / 1000)  # 5ms = 80 samples
+    if len(audio) < fade_samples * 2:
+        return audio
+    audio = audio.copy()
+    # fade in
+    audio[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples)
+    # fade out
+    audio[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples)
+    return audio
+
+
 SAMPLE_RATE = 16000
 
 # ---------------------------------------------------------------------------
@@ -360,7 +373,7 @@ class RecitationSession:
 
         # Append to buffer and full session recording
         self._buffer = np.concatenate([self._buffer, audio_fragment])
-        self._all_audio = np.concatenate([self._all_audio, audio_fragment])
+        self._all_audio = np.concatenate([self._all_audio, _apply_fade(audio_fragment)])
         self._total_samples_fed += len(audio_fragment)
 
         if self.use_vad and self._vad_model is not None:

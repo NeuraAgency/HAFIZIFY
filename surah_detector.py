@@ -152,12 +152,6 @@ class SurahDetector:
                 skipped += 1
                 continue
 
-            # Skip Al-Fatiha 1:1 (Basmala) — it's shared by 113 surahs
-            # and is useless for surah identification.
-            if surah == 1 and ayah == 1:
-                skipped += 1
-                continue
-
             raw_text = (
                 str(value.get("text", "")) if isinstance(value, dict)
                 else str(value or "")
@@ -401,12 +395,12 @@ class SurahLockManager:
 
     def __init__(
         self,
-        min_score:            float = 0.35,   # was 0.20 — require meaningful signal before admitting to history
-        avg_score_threshold:  float = 0.45,   # was 0.28 — require stronger average before locking
-        margin_threshold:     float = 0.15,   # was 0.08 — require clearer separation from 2nd candidate
-        history_size:         int   = 5,      # was 4 — slightly longer window for stability
-        lock_votes:           int   = 3,      # was 2 — require 3 consistent chunks before locking
-        unlock_score:         float = 0.20,   # was 0.15 — slightly higher bar before unlocking
+        min_score:            float = 0.20,
+        avg_score_threshold:  float = 0.28,
+        margin_threshold:     float = 0.08,
+        history_size:         int   = 4,
+        lock_votes:           int   = 2,
+        unlock_score:         float = 0.15,
         unlock_votes:         int   = 3,
     ) -> None:
         self.min_score            = min_score
