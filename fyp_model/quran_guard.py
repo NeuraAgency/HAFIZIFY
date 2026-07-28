@@ -4,6 +4,13 @@ import re
 import difflib
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from rapidfuzz import fuzz as _rfuzz
+    from rapidfuzz.distance import Levenshtein as _rfLev
+    _HAS_RAPIDFUZZ = True
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+
 
 _AR_DIACRITICS = (
     "\u0610\u0611\u0612\u0613\u0614\u0615\u0616\u0617\u0618\u0619\u061A"
@@ -110,6 +117,39 @@ def token_coverage(hyp: str, ref: str) -> float:
     for token in h:
         counts[token] = counts.get(token, 0) + 1
 
+    overlap = 0
+    for token in r:
+        if counts.get(token, 0) > 0:
+            counts[token] -= 1
+            overlap += 1
+    return overlap / max(1, len(r))
+
+
+def _cer_prenorm(hyp_n: str, ref_n: str) -> float:
+    """CER assuming BOTH inputs are already normalized. Skips normalize_arabic()."""
+    if not ref_n:
+        return 1.0
+    return _levenshtein_seq(list(hyp_n), list(ref_n)) / max(1, len(ref_n))
+
+
+def _wer_prenorm(hyp_n: str, ref_n: str) -> float:
+    """WER assuming BOTH inputs are already normalized. Skips normalize_arabic()."""
+    hyp_w = hyp_n.split()
+    ref_w = ref_n.split()
+    if not ref_w:
+        return 1.0
+    return _levenshtein_seq(hyp_w, ref_w) / max(1, len(ref_w))
+
+
+def _coverage_prenorm(hyp_n: str, ref_n: str) -> float:
+    """token_coverage assuming BOTH inputs are already normalized."""
+    h = hyp_n.split()
+    r = ref_n.split()
+    if not h or not r:
+        return 0.0
+    counts: dict = {}
+    for token in h:
+        counts[token] = counts.get(token, 0) + 1
     overlap = 0
     for token in r:
         if counts.get(token, 0) > 0:
@@ -384,13 +424,25 @@ def match_ayah_sequence(
 
     best = None
     for start, end, ref in candidates:
-        cer = compute_cer(hyp, ref)
-        wer = compute_wer(hyp, ref)
-        cov = token_coverage(hyp, ref)
+        cer = _cer_prenorm(hyp, ref)
+        wer = _wer_prenorm(hyp, ref)
+        cov = _coverage_prenorm(hyp, ref)
         span = max(1, end - start + 1)
         span_bonus = min(0.08, 0.01 * span)
-        confidence = max(0.0, min(1.0, 0.60 * (1.0 - cer) + 0.30 * cov + span_bonus))
-        alignment_score = max(0.0, min(1.0, 0.45 * (1.0 - cer) + 0.30 * (1.0 - wer) + 0.25 * cov))
+        # Updated confidence: uses CER (character level), WER (word level), and token coverage.
+        # WER matters for short chunks where a single wrong word is a large percentage error.
+        confidence = max(0.0, min(1.0,
+            0.45 * (1.0 - cer)
+            + 0.20 * (1.0 - wer)
+            + 0.30 * cov
+            + span_bonus
+        ))
+        # alignment_score stays the same — used for sequence vs single-ayah selection
+        alignment_score = max(0.0, min(1.0,
+            0.40 * (1.0 - cer)
+            + 0.30 * (1.0 - wer)
+            + 0.30 * cov
+        ))
         candidate = (start, end, ref, cer, wer, cov, confidence, alignment_score)
         if best is None or (cer, -cov, -confidence) < (best[3], -best[5], -best[6]):
             best = candidate
@@ -437,9 +489,11 @@ def match_ayah(
     best = None
     for key in keys:
         ref = ayah_map[key]
-        cer = compute_cer(hyp, ref)
-        wer = compute_wer(hyp, ref)
-        cov = token_coverage(hyp, ref)
+        # ref is already normalized (stored normalized in ayah_map from load_all_ayat_json)
+        # hyp is already normalized (computed once at the top of match_ayah)
+        cer = _cer_prenorm(hyp, ref)
+        wer = _wer_prenorm(hyp, ref)
+        cov = _coverage_prenorm(hyp, ref)
         confidence = max(0.0, min(1.0, 0.65 * (1.0 - cer) + 0.35 * cov))
         alignment_score = max(0.0, min(1.0, 0.5 * (1.0 - cer) + 0.3 * (1.0 - wer) + 0.2 * cov))
         candidate = (key, ref, cer, wer, cov, confidence, alignment_score)
@@ -460,27 +514,46 @@ def match_ayah(
 
 
 def _partial_word_correction(hyp_text: str, ref_text: str) -> str:
+    """
+    Align hypothesis tokens to reference tokens using SequenceMatcher opcodes,
+    then replace tokens that are close enough (CER <= 0.50) with the reference.
+
+    Unlike the original positional loop, this handles insertions and deletions
+    so that an extra word at position 0 does not cascade wrong corrections across
+    all subsequent tokens.
+    """
     hyp_words = normalize_arabic(hyp_text).split()
     ref_words = normalize_arabic(ref_text).split()
     if not hyp_words or not ref_words:
         return normalize_arabic(hyp_text)
 
-    n = min(len(hyp_words), len(ref_words))
-    out = []
-    for i in range(n):
-        hw = hyp_words[i]
-        rw = ref_words[i]
-        if hw == rw:
-            out.append(hw)
-            continue
-        word_cer = _levenshtein_seq(list(hw), list(rw)) / max(1, len(rw))
-        if word_cer <= 0.50:
-            out.append(rw)
-        else:
-            out.append(hw)
+    import difflib
+    out = list(hyp_words)  # start with a mutable copy
+    matcher = difflib.SequenceMatcher(None, hyp_words, ref_words, autojunk=False)
 
-    if len(hyp_words) > n:
-        out.extend(hyp_words[n:])
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue  # already correct — no change needed
+        elif tag == "replace":
+            # Only replace when edit distance is small — looks like an ASR typo
+            hyp_slice = hyp_words[i1:i2]
+            ref_slice = ref_words[j1:j2]
+            shared = min(len(hyp_slice), len(ref_slice))
+            for offset in range(shared):
+                hw = hyp_slice[offset]
+                rw = ref_slice[offset]
+                word_cer = _levenshtein_seq(list(hw), list(rw)) / max(1, len(rw))
+                if word_cer <= 0.50:
+                    out[i1 + offset] = rw
+            # Extra ref words (ref longer than hyp in this span) — insert them
+            if len(ref_slice) > len(hyp_slice):
+                insert_pos = i2  # position in current out list
+                for extra in ref_slice[shared:]:
+                    out.insert(insert_pos, extra)
+                    insert_pos += 1
+        # "delete" (hyp has words ref doesn't) and "insert" (ref has words hyp doesn't)
+        # are left as-is — we preserve reciter content
+
     return " ".join(out)
 
 
@@ -708,9 +781,21 @@ def guard_inference(
     ignore_leading_basmala: bool = True,
     lock_surah: Optional[int] = None,
 ):
-    _ = (auto_cer_threshold, auto_cov_threshold)
     if allow_auto_correct and correction_mode == "safe":
         correction_mode = "balanced"
+
+    # Use adaptive thresholds if auto_correct is enabled
+    # auto_cer_threshold: when CER is below this, correction fires automatically
+    # auto_cov_threshold: when token coverage is above this, correction fires automatically
+    # These gate the 'allow_auto_correct' flag — if input is clean enough, correct it;
+    # if it is too noisy, don't. This prevents aggressive correction on hallucinated chunks.
+    _effective_auto_correct = allow_auto_correct
+    if allow_auto_correct and correction_mode != "safe":
+        # Pre-check: normalize input and run a quick token count
+        _norm_len = len(normalize_arabic(raw_text).split())
+        # If the text is very short (< 3 tokens), don't auto-correct — too ambiguous
+        if _norm_len < 3:
+            _effective_auto_correct = False
 
     return apply_correction_pipeline(
         raw_text=raw_text,
@@ -721,7 +806,7 @@ def guard_inference(
         window_back=window_back,
         mode=correction_mode,
         preserve_reciter=preserve_reciter,
-        allow_reference_replacement=allow_reference_replacement,
+        allow_reference_replacement=_effective_auto_correct and allow_reference_replacement,
         use_sequence_match=use_sequence_match,
         sequence_max_ayahs=sequence_max_ayahs,
         ignore_leading_basmala=ignore_leading_basmala,
@@ -770,7 +855,10 @@ def get_word_error_annotations(
             status = "correct"
             similarity = 1.0
         else:
-            similarity = difflib.SequenceMatcher(None, norm_word, norm_ref).ratio()
+            if _HAS_RAPIDFUZZ:
+                similarity = _rfuzz.ratio(norm_word, norm_ref) / 100.0
+            else:
+                similarity = difflib.SequenceMatcher(None, norm_word, norm_ref).ratio()
             status = "minor" if similarity >= 0.70 else "major"
 
         annotations.append({
@@ -782,8 +870,17 @@ def get_word_error_annotations(
             "ref_index": ref_index,
         })
 
-    matcher = difflib.SequenceMatcher(None, ref_norm, hyp_norm)
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    if _HAS_RAPIDFUZZ:
+        from rapidfuzz.distance import Opcodes as _RFOpcodes
+        _rf_opcodes = _RFOpcodes.from_editops(
+            _rfLev.editops(ref_norm, hyp_norm)
+        )
+        _opcode_iter = _rf_opcodes
+    else:
+        _sm = difflib.SequenceMatcher(None, ref_norm, hyp_norm, autojunk=False)
+        _opcode_iter = _sm.get_opcodes()
+
+    for tag, i1, i2, j1, j2 in _opcode_iter:
         if tag == "equal":
             for offset, (ref_word, hyp_word) in enumerate(zip(ref_words[i1:i2], hyp_words[j1:j2])):
                 _append(hyp_word, ref_word, hyp_index=j1 + offset, ref_index=i1 + offset)

@@ -13,6 +13,12 @@ import json
 import os
 import re
 import difflib
+try:
+    from rapidfuzz import fuzz as _rfuzz_ldf
+    _LDF_HAS_RAPIDFUZZ = True
+except ImportError:
+    _rfuzz_ldf = None
+    _LDF_HAS_RAPIDFUZZ = False
 from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -33,26 +39,10 @@ _BASMALA_TEXT = "بسم الله الرحمن الرحيم"
 CONFIDENCE_UNCERTAIN_THRESHOLD = 0.30
 
 # ---------------------------------------------------------------------------
-# Arabic helpers (lightweight — reuse quran_guard normalizer if available)
+# Arabic helpers — reuse quran_guard normalizer
 # ---------------------------------------------------------------------------
 
-_DIACRITICS_RE = re.compile(
-    r"[\u0610-\u061A\u064B-\u065F\u0670\u0640"
-    r"\u06D6-\u06ED\u00AB\u00BB\u200F\u200E"
-    r"\u202A-\u202E\uFEFF\u06DD\u06DE۩۞۝]+"
-)
-
-def _normalize(text: str) -> str:
-    """Fast Arabic normalization (strip diacritics, conflate letters)."""
-    if not text:
-        return ""
-    text = _DIACRITICS_RE.sub("", text)
-    text = re.sub(r"[أإآٱ]", "ا", text)
-    text = re.sub(r"ى", "ي", text)
-    text = re.sub(r"ة", "ه", text)
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+from fyp_model.quran_guard import normalize_arabic as _normalize
 
 
 _TAWWUZ_TOKENS = _normalize(_TAWWUZ_TEXT).split()
@@ -69,6 +59,8 @@ def _char_similarity(a: str, b: str) -> float:
         return 1.0
     if not a or not b:
         return 0.0
+    if _LDF_HAS_RAPIDFUZZ:
+        return _rfuzz_ldf.ratio(a, b) / 100.0
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
@@ -236,19 +228,24 @@ class LiveDisplayFormatter:
 
             ref_statuses = ["pending"] * len(ref_norm)
             sm = difflib.SequenceMatcher(None, hyp_norm, ref_norm)
-            error_found = False
             for tag, i1, i2, j1, j2 in sm.get_opcodes():
                 if tag == "equal":
                     for j in range(j1, j2):
                         ref_statuses[j] = "correct"
-                else:
+                elif tag in ("replace", "delete"):
                     for j in range(j1, j2):
                         ref_statuses[j] = "error"
                     if tag == "insert" and j1 < len(ref_statuses):
                         ref_statuses[j1] = "error"
-                    error_found = True
-                if error_found and stop_on_error:
-                    break
+                elif tag == "insert":
+                    if j1 < len(ref_statuses):
+                        ref_statuses[j1] = "error"
+
+            first_error = next((i for i, s in enumerate(ref_statuses) if s == "error"), None)
+            if stop_on_error and first_error is not None:
+                for i in range(first_error + 1, len(ref_statuses)):
+                    if ref_statuses[i] != "correct":
+                        ref_statuses[i] = "pending"
 
             for offset, idx in enumerate(range(start_idx, end_idx + 1)):
                 if offset >= len(ref_statuses):
@@ -408,10 +405,8 @@ class LiveDisplayFormatter:
         )
 
     def _build_invocation_spans(self, include_basmala: bool) -> List[str]:
-        spans = [self._word_span(word, COLORS["correct"]) for word in _TAWWUZ_TEXT.split()]
-        if include_basmala:
-            spans.extend(self._word_span(word, COLORS["correct"]) for word in _BASMALA_TEXT.split())
-        return spans
+        """Return no invocation text — users requested it be removed from display."""
+        return []
 
     def _strip_invocations(self, text: str, include_basmala: bool) -> str:
         tokens = _safe_text(text).split()
@@ -607,7 +602,10 @@ class LiveDisplayFormatter:
         for length in range(1, max_len + 1):
             prev_tail = " ".join(_normalize(w) for w in prev_words[-length:])
             curr_head = " ".join(_normalize(w) for w in curr_words[:length])
-            ratio = difflib.SequenceMatcher(None, prev_tail, curr_head).ratio()
+            if _LDF_HAS_RAPIDFUZZ:
+                ratio = _rfuzz_ldf.ratio(prev_tail, curr_head) / 100.0
+            else:
+                ratio = difflib.SequenceMatcher(None, prev_tail, curr_head).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_len = length

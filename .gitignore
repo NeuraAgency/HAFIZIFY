@@ -9,6 +9,11 @@ dist/
 build/
 *.egg
 
+# ── Environment variables (secrets — DO NOT COMMIT) ───────────────────────────
+.env
+.env.local
+.env.production
+
 # ── Virtual environments ───────────────────────────────────────────────────────
 venv/
 .venv/

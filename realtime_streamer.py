@@ -12,12 +12,19 @@ and correction pipelines. Handles:
 Supported models:
   - whisper-base-quran-lora      : LoRA fine-tuned on top of tarteel-ai base
   - whisper-medium-quran-full    : tarbiyah-ai fully merged Quran-trained whisper-medium
+  - groq-whisper-large-v3-turbo  : Cloud ASR via Groq API (fastest, no local GPU needed)
 """
 
 import os
 import sys
 import time
 import difflib
+try:
+    from rapidfuzz import fuzz as _rfuzz_rt
+    _RT_HAS_RAPIDFUZZ = True
+except ImportError:
+    _rfuzz_rt = None
+    _RT_HAS_RAPIDFUZZ = False
 import numpy as np
 import torch
 import torchaudio
@@ -59,27 +66,6 @@ _MIN_SPEECH_RMS    = 0.005                     # skip near-silent chunks (RMS th
 _TAWWUZ_TEXT = "أعوذ بالله من الشيطان الرجيم"
 _BASMALA_TEXT = "بسم الله الرحمن الرحيم"
 
-_TAWWUZ_TOKENS = [normalize_arabic(w) for w in _TAWWUZ_TEXT.split()]
-_BASMALA_TOKENS = [normalize_arabic(w) for w in _BASMALA_TEXT.split()]
-
-
-def _strip_leading_invocations(text: str) -> str:
-    tokens = str(text or "").split()
-    norm_tokens = [normalize_arabic(t) for t in tokens]
-
-    if norm_tokens[: len(_TAWWUZ_TOKENS)] == _TAWWUZ_TOKENS:
-        tokens = tokens[len(_TAWWUZ_TOKENS):]
-        norm_tokens = norm_tokens[len(_TAWWUZ_TOKENS):]
-
-    if norm_tokens[: len(_BASMALA_TOKENS)] == _BASMALA_TOKENS:
-        tokens = tokens[len(_BASMALA_TOKENS):]
-
-    return " ".join(tokens).strip()
-
-
-_TAWWUZ_TEXT = "أعوذ بالله من الشيطان الرجيم"
-_BASMALA_TEXT = "بسم الله الرحمن الرحيم"
-
 
 def _fold_invocation_token(token: str) -> str:
     token = normalize_arabic(token)
@@ -99,6 +85,8 @@ def _token_close(a: str, b: str) -> bool:
         return True
     if len(a) >= 2 and len(b) >= 2 and (a.startswith(b) or b.startswith(a)):
         return True
+    if _RT_HAS_RAPIDFUZZ:
+        return _rfuzz_rt.ratio(a, b) >= 72.0
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
 
 
@@ -329,19 +317,10 @@ class RealtimeStreamer:
             "adapter_local": "quran-lora-whisper-medium-epoch-1",
             "adapter_hf": "omartariq612/quran-lora-whisper-medium-epoch-1",
         },
-        "wav2vec2-word-quran": {
-            "type": "wav2vec2",
-            "local": "wav2vec2-base-word-by-word-quran-asr",
-            "hf": "hamzasidhu786/wav2vec2-base-word-by-word-quran-asr",
-        },
-        "fyp_model": {
-            "type": "wav2vec2",
-            "local": "fyp_model/weights",
-        },
-        "faster-whisper-base-ar-quran": {
-            "type": "whisper",
-            "local": "faster-whisper-base-ar-quran",
-            "hf": "OdyAsh/faster-whisper-base-ar-quran",
+        # ── Groq cloud ASR ────────────────────────────────────────────────────
+        "groq-whisper-large-v3-turbo": {
+            "type": "groq",
+            # No local path — always uses the Groq REST API
         },
     }
 
@@ -384,6 +363,33 @@ class RealtimeStreamer:
 
         model_info = self._MODEL_REGISTRY.get(self._model_choice, self._MODEL_REGISTRY["whisper-base-quran-lora"])
         self._model_type = model_info["type"]
+
+        # ── Groq cloud model — no local weights to load ───────────────────
+        if self._model_type == "groq":
+            from groq_transcriber import get_groq_transcriber
+            self._model = get_groq_transcriber()  # acts as the "model" object
+            self._processor = None
+            self._forced_decoder_ids = None
+            self._is_faster_whisper = False
+            model_path = "groq-api:whisper-large-v3-turbo"
+            print(f"[RealtimeStreamer] Groq whisper-large-v3-turbo ready (cloud API).")
+            # Jump straight to shared post-load logic
+            if os.path.isfile(self.ayah_json_path):
+                self._ayah_map = load_all_ayat_json(self.ayah_json_path)
+                print(f"[RealtimeStreamer] Loaded {len(self._ayah_map)} ayahs")
+            if self._surah_detector is None and os.path.isfile(self.ayah_json_path):
+                try:
+                    self._surah_detector = SurahDetector(self.ayah_json_path)
+                except Exception as e:
+                    print(f"[RealtimeStreamer] Surah detector not available: {e}")
+            try:
+                from hybrid_pipeline import HybridViterbiPipeline
+                lm_path = os.path.join(_BASE_DIR, "quran_5gram.arpa")
+                if os.path.isfile(lm_path):
+                    self._viterbi_pipeline = HybridViterbiPipeline(self.ayah_json_path, lm_path)
+            except Exception as e:
+                print(f"[RealtimeStreamer] Viterbi pipeline not available: {e}")
+            return
 
         if self._model_type == "wav2vec2":
             model_path = self._resolve_model_path(self._model_choice)
@@ -459,10 +465,17 @@ class RealtimeStreamer:
         else:
             model_path = self._resolve_model_path(self._model_choice)
             print(f"[RealtimeStreamer] Loading model '{self._model_choice}' from {model_path}...")
+            # Detect available cores — use all minus 1 for OS on Pi 5, or 4 on laptop
+            import multiprocessing
+            available_cores = multiprocessing.cpu_count()
+            cpu_threads = max(1, available_cores - 1)  # leave 1 core for OS + VAD
+            print(f"[RealtimeStreamer] Using {cpu_threads}/{available_cores} CPU threads")
             self._model = WhisperModel(
                 model_path,
                 device="cpu",
                 compute_type="int8",
+                cpu_threads=cpu_threads,
+                num_workers=1,
             )
             self._processor = None
             self._forced_decoder_ids = None
@@ -493,7 +506,15 @@ class RealtimeStreamer:
 
     def _decode_chunk(self, audio_np: np.ndarray) -> str:
         audio_np = audio_np.astype(np.float32)
-        
+
+        # ── Groq cloud decode path ────────────────────────────────────────
+        if self._model_type == "groq":
+            try:
+                return self._model.transcribe_array(audio_np, sample_rate=SAMPLE_RATE)
+            except Exception as exc:
+                print(f"[RealtimeStreamer] Groq transcription error: {exc}")
+                return ""
+
         # 200ms silence padding — Whisper pehla frame drop karta hai
         pad = np.zeros(int(0.2 * SAMPLE_RATE), dtype=np.float32)
         audio_np = np.concatenate([pad, audio_np])
@@ -502,13 +523,15 @@ class RealtimeStreamer:
             segments, _ = self._model.transcribe(
                 audio_np,
                 language="ar",
-                beam_size=5,
-                temperature=0.0,
+                beam_size=1,                    # deterministic, fastest on CPU/Pi 5
+                temperature=0.0,               # no sampling randomness
                 repetition_penalty=1.3,
                 no_repeat_ngram_size=3,
-                vad_filter=False,
+                condition_on_previous_text=False,  # prevent hallucination loops
+                without_timestamps=True,           # skip timestamp overhead
+                vad_filter=False,                  # Silero VAD already handles this upstream
             )
-            return " ".join([s.text for s in segments]).strip()
+            return normalize_arabic(" ".join([s.text for s in segments]).strip())
         
         # Original whisper path (fallback)
         audio_np = audio_np[:_WHISPER_MAX_SAMPLES]
@@ -627,16 +650,25 @@ class RealtimeStreamer:
         detection_text = _strip_leading_invocations(raw_text, strip_basmala=True)
 
         # 2. Accumulate text + detect surah on a rolling window
+        # Initialize as a list of chunk strings rather than a flat token list
         if not hasattr(session, "_detection_buffer"):
-            session._detection_buffer = []
-        if detection_text:
-            session._detection_buffer.extend(detection_text.split())
-            session._detection_buffer = session._detection_buffer[-40:]
-        accumulated_text = " ".join(session._detection_buffer)
+            session._detection_buffer = []   # list of stripped chunk strings
+
+        if detection_text and len(detection_text.split()) >= 2:
+            session._detection_buffer.append(detection_text.strip())
+            # Keep only the last 8 chunks (approx 40–60 tokens of context)
+            session._detection_buffer = session._detection_buffer[-8:]
+
+        # Join chunks with a double-space separator so n-grams don't bleed
+        # across chunk boundaries during scoring
+        accumulated_text = "  ".join(session._detection_buffer)
 
         lock_state = None
         lock_surah = None
-        if session.surah is None and self._surah_detector is not None and getattr(session, "surah_lock_manager", None):
+        if (session.surah is None
+                and self._surah_detector is not None
+                and getattr(session, "surah_lock_manager", None)
+                and len(session._detection_buffer) >= 2):    # was >= _MIN_DETECT_TOKENS (8 tokens) — now counting chunks
             candidates = self._surah_detector.detect(accumulated_text, top_k=5)
             lock_state = session.surah_lock_manager.update(candidates)
             session.surah_lock_state = lock_state
@@ -673,8 +705,8 @@ class RealtimeStreamer:
         effective_mode = "aggressive" if correction_mode == "balanced" else correction_mode
         correction_state = self.correction_engine.state if qari_mode else "LISTENING"
         strict_correction = qari_mode and correction_state in ("CORRECTING", "VERIFYING")
-        lookahead = 0 if strict_correction else 5
-        window_back = 0 if strict_correction else 2
+        lookahead = 0 if strict_correction else 10     # was 5 — wider forward search
+        window_back = 0 if strict_correction else 5    # was 2 — wider backward search
         use_sequence = False if strict_correction else True
         sequence_max = 1 if strict_correction else 8
 
@@ -723,10 +755,22 @@ class RealtimeStreamer:
         guard_conf = float(guard_result.get("confidence") or 0.0)
         guard_key = guard_result.get("matched_key")
         guard_surah = None
-        if isinstance(guard_key, tuple) and len(guard_key) >= 1:
+        guard_ayah = None
+        if isinstance(guard_key, tuple) and len(guard_key) >= 2:
             guard_surah = guard_key[0]
+            guard_ayah = guard_key[1]
 
-        if session.surah is None and guard_surah and guard_conf >= 0.55 and getattr(session, "surah_lock_manager", None):
+        # Skip synthetic candidate injection when:
+        #  - matched ayah is 1 (Basmala — shared by 113 surahs, inherently ambiguous)
+        #  - confidence is below 0.70 (too noisy to trust)
+        #  - detection buffer has < 8 tokens (not enough signal yet)
+        _guard_has_enough_signal = (
+            guard_ayah is not None
+            and guard_ayah != 1
+            and guard_conf >= 0.70
+            and len(getattr(session, '_detection_buffer', [])) >= 2
+        )
+        if session.surah is None and guard_surah and _guard_has_enough_signal and getattr(session, "surah_lock_manager", None):
             boosted_score = min(0.95, guard_conf * 1.2)
             synthetic_candidates = [
                 SurahCandidate(

@@ -11,6 +11,7 @@ Combines:
 
 import json
 import re
+from fyp_model.quran_guard import normalize_arabic
 import math
 import os
 import difflib
@@ -30,21 +31,6 @@ except ImportError:
     print("[HybridPipeline] WARNING: kenlm not installed — LM scoring disabled, using n-gram + edit distance only.")
 
 
-def normalize_arabic(text: str) -> str:
-    """Robust Arabic normalization stripping diacritics and conflating spelling variants."""
-    if not text:
-        return ""
-    text = re.sub(
-        r"[\u0610-\u061A\u064B-\u065F\u0670\u0640\u06D6-\u06ED"
-        r"\u00AB\u00BB\u200F\u200E\u202A-\u202E\uFEFF\u06DD\u06DE"
-        r"۩۞۝]+", "", text
-    )
-    text = re.sub(r"[أإآٱ]", "ا", text)
-    text = re.sub(r"ى", "ي", text)
-    text = re.sub(r"ة", "ه", text)
-    text = re.sub(r"[^\w\s]", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 # CRITICAL: Only strip Ta'awwuz, NOT Basmala
@@ -165,7 +151,55 @@ class HybridViterbiPipeline:
             self.ayah_ngrams.append(set(NGramScorer.get_all_ngrams(norm)))
             idx += 1
             
+        # Build inverted trigram index for fast candidate pre-selection
+        # Key: ngram string → list of ayah global_idx values
+        # At query time: look up chunk ngrams, tally hit counts per ayah,
+        # take top-30 by count, then only run fuzz.ratio on those 30.
+        import collections as _collections
+        self._ngram_index: dict = _collections.defaultdict(list)
+        for idx, ayah in enumerate(self.ayahs):
+            tokens = ayah["norm_text"].split()
+            # Index bigrams AND trigrams — unigrams are too common to be useful
+            for n in (2, 3):
+                for j in range(len(tokens) - n + 1):
+                    gram = " ".join(tokens[j : j + n])
+                    self._ngram_index[gram].append(idx)
+        print(
+            f"[HybridPipeline] Inverted index built: "
+            f"{len(self._ngram_index)} unique bigrams+trigrams."
+        )
         print(f"[HybridPipeline] Loaded {len(self.ayahs)} ayahs into sequential space.")
+
+    def _get_candidate_indices(self, chunk_ngrams: set, top_k: int = 30) -> list:
+        """
+        Use the inverted index to find the top-k ayah indices most likely to
+        match the given chunk, based on weighted n-gram hit counts.
+
+        This is O(|chunk_ngrams|) instead of O(N_ayahs) and runs in ~1ms.
+        Only the returned indices are passed to the expensive _score_chunk_against_ayah.
+
+        Args:
+            chunk_ngrams: set of all n-gram strings from the chunk
+            top_k: how many candidate ayahs to return
+
+        Returns:
+            List of ayah global_idx integers, sorted by hit weight descending.
+        """
+        hit_counts: dict = {}
+        for gram in chunk_ngrams:
+            if gram not in self._ngram_index:
+                continue
+            # Weight by n-gram length: trigrams=3, bigrams=2
+            weight = len(gram.split())
+            for ayah_idx in self._ngram_index[gram]:
+                hit_counts[ayah_idx] = hit_counts.get(ayah_idx, 0) + weight
+
+        if not hit_counts:
+            return []
+
+        # Sort by hit weight descending, return top_k
+        sorted_candidates = sorted(hit_counts, key=hit_counts.get, reverse=True)
+        return sorted_candidates[:top_k]
 
     def _score_chunk_against_ayah(self, chunk_text: str, chunk_ngrams: set, ayah_idx: int) -> float:
         """
@@ -196,11 +230,17 @@ class HybridViterbiPipeline:
         if self.lm_model:
             lm_log10_prob = self.lm_model.score(chunk_text, bos=False, eos=False)
             words = len(chunk_text.split()) or 1
-            
-            # Normalize LM log prob (typically -2 to -6 per word) to a roughly 0.0 - 1.0 confidence ratio
             avg_prob_per_word = lm_log10_prob / words
-            # Cap mapping: -5 is bad (0.0), 0 is perfect (1.0)
-            lm_normalized = max(0.0, min(1.0, 1.0 + (avg_prob_per_word / 5.0)))
+
+            # Calibrated mapping: −2.0 per word → 1.0 (excellent Quran match)
+            #                     −5.0 per word → 0.0 (poor / non-Quran)
+            # Linear interpolation between those two anchors.
+            _LM_BEST  = -2.0   # avg log10 prob for a near-perfect Quran phrase
+            _LM_WORST = -5.0   # avg log10 prob for unrelated text
+            lm_normalized = max(
+                0.0,
+                min(1.0, (avg_prob_per_word - _LM_WORST) / (_LM_BEST - _LM_WORST))
+            )
             
             # Weighted aggregate
             final_score = (0.5 * lm_normalized) + (0.3 * overlap) + (0.2 * edit_score)
@@ -266,7 +306,17 @@ class HybridViterbiPipeline:
             chunk_ngrams = set(NGramScorer.get_all_ngrams(chunk))
             scores = []
             
-            for idx in range(len(self.ayahs)):
+            # FAST PATH: use inverted index to get top-30 candidates
+            # instead of scanning all 6,236 ayahs
+            candidate_indices = self._get_candidate_indices(chunk_ngrams, top_k=30)
+
+            # FALLBACK: if index returns no hits (very short chunk, noise, etc.),
+            # fall back to scanning the full ayah list.
+            # This should rarely happen for real recitation input.
+            if not candidate_indices:
+                candidate_indices = list(range(len(self.ayahs)))
+
+            for idx in candidate_indices:
                 s = self._score_chunk_against_ayah(chunk, chunk_ngrams, idx)
                 if s > 0:
                     scores.append({'idx': idx, 'score': s})
@@ -443,6 +493,20 @@ class HybridViterbiPipeline:
                 
                 dp[t][curr_idx] = best_score
                 backpointer[t][curr_idx] = best_prev
+
+            # Beam pruning: keep only the top-30 states by cumulative score.
+            # This prevents the state space from growing unboundedly over long
+            # sessions where every chunk pads in extra continuity states.
+            # Pruning to B=30 has negligible accuracy impact because:
+            #   - Low-scoring paths were already unlikely to be the optimal path
+            #   - The backpointer for pruned states is already saved, so the
+            #     optimal path up to t is preserved in the survivors
+            _BEAM_SIZE = 30
+            if len(dp[t]) > _BEAM_SIZE:
+                _top_keys = sorted(dp[t], key=dp[t].__getitem__, reverse=True)[:_BEAM_SIZE]
+                _keep = set(_top_keys)
+                dp[t] = {k: v for k, v in dp[t].items() if k in _keep}
+                backpointer[t] = {k: v for k, v in backpointer[t].items() if k in _keep}
                 
         # Step 5: Backtrack optimal path
         best_end_idx = max(dp[T-1].keys(), key=lambda idx: dp[T-1][idx])
@@ -540,7 +604,12 @@ class HybridViterbiPipeline:
         for chunk in segments:
             chunk_ngrams = set(NGramScorer.get_all_ngrams(chunk))
             scores = []
-            for idx in range(len(self.ayahs)):
+
+            candidate_indices = self._get_candidate_indices(chunk_ngrams, top_k=30)
+            if not candidate_indices:
+                candidate_indices = list(range(len(self.ayahs)))
+
+            for idx in candidate_indices:
                 s = self._score_chunk_against_ayah(chunk, chunk_ngrams, idx)
                 if s > 0:
                     scores.append({

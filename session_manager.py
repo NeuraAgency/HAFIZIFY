@@ -65,15 +65,20 @@ SAMPLE_RATE = 16000
 # VAD tuning constants — optimised for Quran recitation
 # ---------------------------------------------------------------------------
 
-# Split on silence as short as 100ms (between ayahs there is a clear pause)
-_VAD_MIN_SILENCE_MS      = 300     # OK — keep as is
-_VAD_MIN_SPEECH_MS       = 200     # was 200 — ignore short noise bursts more aggressively
-_VAD_THRESHOLD           = 0.30    # was 0.25 — slightly less sensitive, reduces false triggers
+# ── VAD tuning for Quran recitation (long sessions) ─────────────────────────
+# The critical value is _VAD_MIN_SILENCE_MS: Quran reciters pause between
+# ayahs for roughly 50–200ms.  Setting this to 100ms ensures those pauses
+# are detected as split points, so a 19-minute session gets broken into
+# individual ayah-length chunks instead of one giant speech segment that
+# exceeds Whisper's 30-second window.
+_VAD_MIN_SILENCE_MS      = 100     # was 300 — split on short ayah-boundary pauses
+_VAD_MIN_SPEECH_MS       = 150     # was 200 — catch short ayahs (e.g. Al-Fatiha verses)
+_VAD_THRESHOLD           = 0.35    # was 0.30 — slightly more sensitive for quiet recitation
 _VAD_END_PAD_MS          = 80      # OK — keep as is
-_VAD_MIN_CHUNK_DURATION  = 2.0     # was 0.3 — THIS was the main culprit, 2s minimum for Whisper
-_VAD_MAX_CHUNK_DURATION  = 8.0     # OK — keep as is
+_VAD_MIN_CHUNK_DURATION  = 2.0     # was 0.3 — 2s minimum ensures Whisper has enough context
+_VAD_MAX_CHUNK_DURATION  = 8.0     # safety net — split any segment longer than 8s
 _VAD_RESCAN_INTERVAL     = 0.15    # OK — keep as is
-_VAD_TAIL_CONFIRM        = 0.2    # was 0.12 — wait a bit longer to confirm speech actually ended
+_VAD_TAIL_CONFIRM        = 0.15    # was 0.2 — faster ayah-end confirmation for quick transitions
 
 
 @dataclass
@@ -194,12 +199,12 @@ class RecitationSession:
         audio_array: np.ndarray,
         sr: int = SAMPLE_RATE,
     ) -> List[Dict[str, int]]:
-        """Run Silero VAD with aggressive settings for Quran recitation.
+        """Run Silero VAD with settings tuned for Quran recitation.
 
-        Key changes vs original:
-          - threshold lowered to 0.35 (catches soft recitation)
-          - min_silence_duration_ms = 100ms (split on short pauses between ayahs)
-          - min_speech_duration_ms  = 200ms (ignore noise bursts)
+        Tuned for long sessions (19+ minutes):
+          - threshold = 0.35          Sensitive enough for quiet recitation
+          - min_silence_duration_ms   = 100ms   Split on short ayah-boundary pauses
+          - min_speech_duration_ms    = 150ms   Catch short ayahs (e.g. Al-Fatiha)
         """
         if not self.use_vad or self._vad_model is None:
             return []
@@ -536,19 +541,18 @@ class RecitationSession:
         self._pending_fragment = fragment
         guard_result["corrected_text"] = corrected_text
 
-        # Advance ayah tracking
+        # Update current ayah tracking based on matched ayah
         matched_key = guard_result.get("matched_key")
-        if guard_result.get("verdict") in ("ok", "minor") and matched_key and isinstance(matched_key, (tuple, list)):
+        if matched_key and isinstance(matched_key, (tuple, list)):
             matched_surah = matched_key[0]
             matched_ayah = matched_key[1]
             if self.surah is None:
                 self.surah = matched_surah
                 self.start_ayah = matched_ayah
-                self.current_ayah = matched_ayah + 1
+                self.current_ayah = matched_ayah
             elif matched_surah == self.surah:
-                new_ayah = matched_ayah + 1
-                if new_ayah > self.current_ayah:
-                    self.current_ayah = new_ayah
+                if matched_ayah > self.current_ayah:
+                    self.current_ayah = matched_ayah
 
         result = ChunkResult(
             chunk_index=actual_index,

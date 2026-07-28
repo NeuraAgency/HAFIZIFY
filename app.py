@@ -43,6 +43,14 @@ def _clean_transcript_text(text: str) -> str:
 
 def _decode_raw_text(model, processor, audio_np: np.ndarray, device: str, model_type: str = "whisper") -> str:
     """Greedy decode for upload tab."""
+    if model_type == "groq":
+        # model is a GroqTranscriber instance
+        try:
+            return model.transcribe_array(audio_np, sample_rate=16000)
+        except Exception as exc:
+            print(f"[Hafizify] Groq transcription error: {exc}")
+            return ""
+
     if model_type == "wav2vec2":
         inputs = processor(audio_np, sampling_rate=16000, return_tensors="pt")
         input_values = inputs.input_values.to(device)
@@ -96,7 +104,7 @@ def _decode_raw_text(model, processor, audio_np: np.ndarray, device: str, model_
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Model selection — only the two supported models
+# Model selection — supported models
 MODEL_REGISTRY = {
     "whisper-base-quran-lora": {
         "type": "whisper",
@@ -108,11 +116,17 @@ MODEL_REGISTRY = {
         "local": "faster-whisper-base-ar-quran",
         "hf": "OdyAsh/faster-whisper-base-ar-quran",
     },
+    # ── Groq cloud ASR ────────────────────────────────────────────────────
+    "groq-whisper-large-v3-turbo": {
+        "type": "groq",
+        # No local weights — always calls the Groq REST API
+    },
 }
 
 MODEL_CHOICES = [
     "whisper-base-quran-lora",
     "faster-whisper-base-ar-quran",
+    "groq-whisper-large-v3-turbo",
 ]
 _current_model_choice = None
 _model_type = "whisper"  # always whisper now
@@ -182,6 +196,26 @@ def load_models_once(model_choice="whisper-base-quran-lora"):
 
     info = MODEL_REGISTRY[model_choice]
     _model_type = info["type"]
+
+    # ── Groq cloud model — no local weights to resolve ──────────────────
+    if _model_type == "groq":
+        from groq_transcriber import get_groq_transcriber
+        model = get_groq_transcriber()
+        processor = None
+        _forced_decoder_ids = None
+        _current_model_choice = model_choice
+        print(f"[Hafizify] Groq whisper-large-v3-turbo ready (cloud API).")
+        # Still load ayah map + surah detector
+        ayah_path = os.path.join(BASE_DIR, "fyp_model", "all_ayat.json")
+        lm_path = os.path.join(BASE_DIR, "quran_5gram.arpa")
+        if viterbi_pipeline is None:
+            viterbi_pipeline = HybridViterbiPipeline(ayah_path, lm_path)
+        if ayah_map is None and os.path.isfile(ayah_path):
+            ayah_map = load_all_ayat_json(ayah_path)
+        if SURAH_DETECTOR is None and os.path.isfile(ayah_path):
+            SURAH_DETECTOR = SurahDetector(ayah_path)
+        return
+
     local_key = info.get("local")
     if local_key:
         local_path = os.path.join(BASE_DIR, *local_key.replace("\\", "/").split("/"))
@@ -202,6 +236,13 @@ def load_models_once(model_choice="whisper-base-quran-lora"):
         )
         processor = None
         _forced_decoder_ids = None
+    elif _model_type == "groq":
+        # No local weights — load the Groq API client as the "model"
+        from groq_transcriber import get_groq_transcriber
+        model = get_groq_transcriber()
+        processor = None
+        _forced_decoder_ids = None
+        print(f"[Hafizify] Groq whisper-large-v3-turbo ready (cloud API).")
     else:  # whisper (HuggingFace)
         model = WhisperForConditionalGeneration.from_pretrained(
             model_path,

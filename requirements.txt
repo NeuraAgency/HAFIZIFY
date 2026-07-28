@@ -14,3 +14,9 @@ gradio
 pyctcdecode
 rapidfuzz
 silero-vad>=5.0
+# kenlm requires build tools: see https://github.com/kpu/kenlm
+kenlm
+edge-tts
+pygame
+faster-whisper
+groq

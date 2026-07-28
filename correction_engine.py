@@ -18,6 +18,8 @@ MAX_ATTEMPTS = 3
 class CorrectionEngine:
     def __init__(self, on_state_change=None):
         self.state = "LISTENING"  # LISTENING, CORRECTING, VERIFYING, CONFIRMED
+        self._consecutive_errors = 0      # require 2 errors in a row before interrupting
+        self._min_trigger_confidence = 0.30  # only interrupt if conf > this (avoids garbled chunks)
         self.current_ayah = None
         self.current_surah = None
         self.correction_attempts = 0
@@ -43,7 +45,6 @@ class CorrectionEngine:
         except pygame.error as e:
             print(f"[CorrectionEngine] WARNING: Audio init failed ({e}). TTS disabled.")
             self._audio_enabled = False
-            # Fallback for headless/no-device environments
             os.environ["SDL_AUDIODRIVER"] = "dummy"
             try:
                 pygame.mixer.init()
@@ -66,11 +67,16 @@ class CorrectionEngine:
                 async def _speak():
                     communicate = edge_tts.Communicate(text, VOICE)
                     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                        tmp_path = f.name
-                    await communicate.save(tmp_path)
-                    return tmp_path
+                        _tmp = f.name
+                    await communicate.save(_tmp)
+                    return _tmp
 
-                tmp_path = asyncio.run(_speak())
+                import asyncio as _asyncio
+                _loop = _asyncio.new_event_loop()
+                try:
+                    tmp_path = _loop.run_until_complete(_speak())
+                finally:
+                    _loop.close()
                 pygame.mixer.music.load(tmp_path)
                 pygame.mixer.music.play()
                 while pygame.mixer.music.get_busy():
@@ -101,6 +107,7 @@ class CorrectionEngine:
         surah_num: int,
         wrong_words: list[str] | None = None,
         correction_spans: list[dict] | None = None,
+        confidence: float = 1.0,
     ) -> dict:
         """
         Call this after every chunk is processed.
@@ -112,7 +119,8 @@ class CorrectionEngine:
 
             if self.state == "LISTENING":
                 return self._handle_listening(
-                    verdict, raw_asr, correct_ayah_text, wrong_words, correction_spans
+                    verdict, raw_asr, correct_ayah_text, wrong_words, correction_spans,
+                    confidence=confidence,
                 )
             
             elif self.state == "VERIFYING":
@@ -128,21 +136,33 @@ class CorrectionEngine:
         correct_ayah_text,
         wrong_words,
         correction_spans=None,
+        confidence: float = 1.0,
     ) -> dict:
         if verdict == "ok":
             self.total_ok += 1
+            self._consecutive_errors = 0   # reset on success
             self._notify("LISTENING")
             return {"action": "continue", "state": "LISTENING"}
 
         elif verdict == "minor":
             self.total_minor += 1
+            self._consecutive_errors = 0   # minor is OK, reset counter
             self._notify("LISTENING")
-            # Minor error — show warning but let reciter continue
-            return {"action": "warn", "state": "LISTENING", 
-                    "message": "تحسين بسيط مطلوب"}  # "Minor improvement needed"
+            return {"action": "warn", "state": "LISTENING",
+                    "message": "تحسين بسيط مطلوب"}
 
         elif verdict == "error":
             self.total_errors += 1
+            self._consecutive_errors += 1
+
+            # Don't interrupt on isolated bad chunks — require 2 consecutive errors
+            # AND sufficient confidence (low conf = garbled audio, not a real mistake)
+            if self._consecutive_errors < 2 or confidence < self._min_trigger_confidence:
+                self._notify("LISTENING")
+                return {"action": "warn", "state": "LISTENING",
+                        "message": f"خطأ محتمل (محاولة {self._consecutive_errors}/2)"}
+
+            self._consecutive_errors = 0
             self.correction_attempts = 0
             self._correction_id += 1
             correction_id = self._correction_id
@@ -155,7 +175,6 @@ class CorrectionEngine:
             )
             self._pending_wrong_words = [c["text"] for c in self._pending_corrections if c.get("text")]
             
-            # Log error
             self.error_history.append({
                 "ayah": self.current_ayah,
                 "surah": self.current_surah,
@@ -167,7 +186,6 @@ class CorrectionEngine:
                 "skipped": False,
             })
             
-            # Speak wrong words only (one by one), then verify
             threading.Thread(
                 target=self._speak_words_and_verify,
                 args=(list(self._pending_corrections), correction_id),
@@ -180,7 +198,6 @@ class CorrectionEngine:
     # ─── VERIFYING state ───────────────────────────────────
     def _handle_verifying(self, verdict, raw_asr, correct_ayah_text, wrong_words) -> dict:
         if verdict == "ok":
-            # Correct! Update history
             if self.error_history:
                 self.error_history[-1]["resolved"] = True
                 self.error_history[-1]["attempts"] = self.correction_attempts
@@ -192,10 +209,9 @@ class CorrectionEngine:
             self.state = "LISTENING"
             self._notify("LISTENING")
             
-            # Praise
             threading.Thread(
                 target=self.speak, 
-                args=("أحسنت",),  # "Well done"
+                args=("أحسنت",),
                 daemon=True
             ).start()
             
@@ -203,11 +219,9 @@ class CorrectionEngine:
                     "message": "أحسنت — تابع"}
 
         else:
-            # Still wrong
             self.correction_attempts += 1
             
             if self.correction_attempts > self.max_attempts:
-                # Too many attempts — skip and move on
                 if self.error_history:
                     self.error_history[-1]["skipped"] = True
                     self.error_history[-1]["attempts"] = self.correction_attempts
@@ -226,7 +240,6 @@ class CorrectionEngine:
                 return {"action": "skip", "state": "LISTENING",
                         "message": "تابع — سنمر للآية التالية"}
             else:
-                # Try again
                 self._correction_id += 1
                 correction_id = self._correction_id
                 self.state = "CORRECTING"
@@ -243,7 +256,6 @@ class CorrectionEngine:
 
     # ─── Helpers ───────────────────────────────────────────
     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):
-        """Speak wrong words one by one then switch to VERIFYING."""
         try:
             for correction in corrections:
                 if not self._play_quran_correction(correction):
@@ -259,7 +271,6 @@ class CorrectionEngine:
             self._notify("VERIFYING")
 
     def _speak_words_and_continue(self, corrections: list[dict]):
-        """Speak wrong words when skipping."""
         try:
             for correction in corrections:
                 if not self._play_quran_correction(correction):
@@ -271,7 +282,7 @@ class CorrectionEngine:
 
     def _build_pending_corrections(self, wrong_words: list, correction_spans: list[dict]) -> list[dict]:
         corrections: list[dict] = []
-        max_len = max(len(wrong_words), len(correction_spans))
+        max_len = max(len(wrong_words), len(correction_spans)) if (wrong_words or correction_spans) else 0
 
         for idx in range(max_len):
             word = wrong_words[idx] if idx < len(wrong_words) else ""
@@ -339,10 +350,6 @@ class CorrectionEngine:
             return list(self._pending_wrong_words)
 
     def consume_pending_match(self, recited_text: str) -> bool:
-        """Consume a pending correction if the recited text matches.
-
-        Returns True if all pending corrections are cleared after consumption.
-        """
         with self._state_lock:
             norm_recited = normalize_arabic(recited_text)
             if not norm_recited:
