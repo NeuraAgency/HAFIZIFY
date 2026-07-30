@@ -257,6 +257,8 @@ class LiveDisplayFormatter:
             lock_key = (int(surah), idx)
             if status == "correct":
                 self._surah_correct_locks[lock_key] = True
+            elif status == "error":
+                self._surah_correct_locks[lock_key] = False
             elif self._surah_correct_locks.get(lock_key):
                 statuses[idx] = "correct"
 
@@ -474,6 +476,8 @@ class LiveDisplayFormatter:
             lock_key = (reference_key, idx)
             if status == "correct":
                 self._expected_correct_locks[lock_key] = True
+            elif status == "error":
+                self._expected_correct_locks[lock_key] = False
             elif self._expected_correct_locks.get(lock_key):
                 statuses[idx] = "correct"
 

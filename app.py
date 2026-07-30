@@ -180,17 +180,26 @@ def _process_queue_worker():
             task = _chunk_queue.get(timeout=0.5)
         except queue.Empty:
             continue
-            
+
         try:
             if len(task) == 4:
                 session, chunk_tuple, correction_mode, qari_mode = task
             else:
                 session, chunk_tuple, correction_mode = task
                 qari_mode = False
-            # Always process the chunk even if the session has been deactivated
-            # (the stop handler sets is_active=False AFTER the queue is drained,
-            # so this guard is now just a safety net for truly orphaned tasks).
+
             chunk_audio, chunk_start, chunk_end = chunk_tuple
+
+            # If Qari mode is mid-correction (not LISTENING), this chunk was
+            # queued from audio recited BEFORE the correction was heard.
+            # Processing it now would corrupt the Qari's state machine and
+            # make it look like the ASR "moved on" while Qari is stuck.
+            # Drop it instead.
+            if qari_mode and rt_streamer.correction_engine.state != "LISTENING":
+                session.discard_pending_chunk(chunk_start, chunk_end)
+                print(f"[Worker] Dropped stale chunk (Qari state={rt_streamer.correction_engine.state})")
+                continue
+
             rt_streamer.process_chunk(
                 session, chunk_audio, correction_mode=correction_mode,
                 qari_mode=qari_mode,
@@ -511,25 +520,9 @@ def transcribe(
             evaluation_report,
         )
     except Exception as e:
-        comparison, full_decode = _build_session_comparison(session, correction_mode)
-        viterbi_text = full_decode.get("viterbi_result", {}).get("matched_ayah_text", "")
-        viterbi_path = full_decode.get("viterbi_result", {}).get("aligned_ayahs", [])
-                
-        try:
-            import traceback
-            traceback.print_exc()
-            comparison = f"Error computing comparison: {e}"
-            full_decode = {}
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            comparison = f"Error computing comparison: {e}"
-            full_decode = {}
-
-        yield (
-            "🟡 Finishing processing... computing final comparison...",
-            merged_html, error_html, all_raw, all_corrected, chunks_table, comparison, {}, guessed, badge_html, None, _format_correction_status("FINISHED") if qari_mode else ""
-        )
+        import traceback
+        traceback.print_exc()
+        return (f"Transcription error: {e}", "", "N/A", "error", "N/A", "N/A", {})
 
 
 # ---------------------------------------------------------------------------
@@ -744,7 +737,20 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode):
         return no_update
         
     if qari_mode and getattr(rt_streamer, "_vad_paused", False):
-        # Audio not processed while correcting
+        # Update _last_fed_samples so we don't process audio accumulated during TTS
+        sr_temp, audio_temp = audio_data
+        audio_temp = audio_temp.astype(np.float32)
+        if audio_temp.max() > 1.0:
+            audio_temp = audio_temp / 32768.0
+        # Update cumulative offset so resume doesn't include TTS-era audio
+        if sr_temp != 16000:
+            g = gcd(16000, sr_temp)
+            estimated_16k_len = int(len(audio_temp) * 16000 / sr_temp)
+        else:
+            estimated_16k_len = len(audio_temp)
+        session_ref._cumulative_offset = estimated_16k_len
+        session_ref._last_fed_samples = estimated_16k_len
+        session_ref.skip_paused_audio()
         correction_state = rt_streamer.correction_engine.state
         return (
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
@@ -1115,26 +1121,34 @@ def stop_live_session(correction_mode, qari_mode):
 # ---------------------------------------------------------------------------
 
 _APP_CSS = """
-.live-status { 
-    font-size: 1.1em; 
-    padding: 12px; 
-    border-radius: 8px; 
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
-    color: #e0e0e0; 
-    border: 1px solid #0f3460;
+/* Hide Tab Navigation Bar */
+.tabs > .tab-nav, .tab-nav, div[role="tablist"], button[role="tab"], .tabs-nav, .tab-buttons {
+    display: none !important;
 }
+
+.live-status { 
+    font-size: 1.05em; 
+    padding: 14px; 
+    border-radius: 8px; 
+    background: rgba(80, 175, 199, 0.08); 
+    color: #e2e8f0; 
+    border: 1px solid rgba(80, 175, 199, 0.25);
+}
+
 .transcript-box textarea { 
     font-family: 'Amiri', 'Traditional Arabic', serif !important; 
-    font-size: 1.3em !important; 
-    line-height: 2 !important; 
+    font-size: 1.4em !important; 
+    line-height: 2.1 !important; 
     direction: rtl !important; 
     text-align: right !important;
 }
+
 .chunk-table { 
-    font-size: 0.85em; 
+    font-size: 0.88em; 
 }
+
 .comparison-panel {
-    border: 1px solid #30475e;
+    border: 1px solid rgba(80, 175, 199, 0.2);
     border-radius: 8px;
     padding: 16px;
     background: #1a1a2e;
@@ -1192,11 +1206,13 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             ["safe", "balanced", "aggressive"],
                             value="balanced",
                             label="Correction Mode",
+                            visible=False,
                         )
                         auto_surah_detect_checkbox = gr.Checkbox(
                             value=False,
                             label="Auto Surah Detection",
                             info="Disable automatic surah locking and guessing",
+                            visible=False,
                         )
                         qari_mode_checkbox = gr.Checkbox(
                             value=False,
@@ -1242,11 +1258,13 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                         label="🔍 Guessed Surah (auto-detected)",
                         value="Listening...",
                         interactive=False,
+                        visible=False,
                     )
 
                     surah_badge_html = gr.HTML(
                         label="Surah Lock",
                         value=_format_surah_badge(None),
+                        visible=False,
                     )
                     
                     correction_status_box = gr.HTML(
@@ -1267,6 +1285,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                     error_panel = gr.HTML(
                         label="Error Analysis",
                         value=LiveDisplayFormatter._error_panel_html(0, 0, 0, 0, 0, 0.0),
+                        visible=False,
                     )
 
                     with gr.Accordion("📝 Raw vs Corrected", open=False):

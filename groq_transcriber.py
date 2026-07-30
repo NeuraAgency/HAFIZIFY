@@ -20,6 +20,11 @@ import tempfile
 import wave
 import numpy as np
 
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+
 # Load .env file if present so GROQ_API_KEY is available without manual export
 _env_path = os.path.join(os.path.dirname(__file__), ".env")
 try:
@@ -64,18 +69,24 @@ class GroqTranscriber:
     """Wraps the Groq Audio Transcription API for whisper-large-v3-turbo."""
 
     def __init__(self, api_key: str | None = None):
+        if Groq is None:
+            raise ImportError(
+                "The 'groq' Python package is not installed. Please run `pip install groq`."
+            )
         key = api_key or os.environ.get("GROQ_API_KEY")
         if not key:
             raise ValueError(
                 "Groq API key not found. Set GROQ_API_KEY env var or pass api_key=."
             )
         try:
-            from groq import Groq
-        except ImportError:
-            raise ImportError(
-                "groq package not installed. Run: pip install groq"
+            import httpx
+            http_client = httpx.Client(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
             )
-        self._client = Groq(api_key=key)
+            self._client = Groq(api_key=key, http_client=http_client)
+        except Exception:
+            self._client = Groq(api_key=key)
 
     # ------------------------------------------------------------------
     # Public helpers

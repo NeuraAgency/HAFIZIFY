@@ -274,10 +274,10 @@ class RealtimeStreamer:
 
     def _on_correction_state_change(self, state: str):
         print(f"[CorrectionEngine] State → {state}")
-        if state == "VERIFYING":
-            self._vad_paused = False  # sunna shuru karo
+        if state in ("VERIFYING", "LISTENING"):
+            self._vad_paused = False  # reopen mic after correction or state reset
         elif state == "CORRECTING":
-            self._vad_paused = True   # mat suno jab bol raha ho
+            self._vad_paused = True   # pause mic while correction TTS is playing
 
     def set_model_choice(self, model_choice: str):
         """Set which model to use. Forces reload if different from current."""
@@ -358,6 +358,39 @@ class RealtimeStreamer:
         print(f"[RealtimeStreamer] Local folder '{local_path}' not found — downloading from HuggingFace: {hf_id}")
         return hf_id
 
+    def _get_ct2_threading_params(self) -> dict:
+        """Determine optimal CPU/device threading and compute type for CTranslate2 / faster-whisper."""
+        import multiprocessing
+        env_threads = os.getenv("CT2_CPU_THREADS")
+        env_inter = os.getenv("CT2_INTER_THREADS")
+        env_compute = os.getenv("CT2_COMPUTE_TYPE")
+
+        avail_cores = multiprocessing.cpu_count()
+        if env_threads:
+            cpu_threads = int(env_threads)
+        else:
+            # Physical core count preference (e.g. 6 on 12-thread i7) to prevent OpenMP thrashing
+            cpu_threads = max(1, avail_cores // 2 if avail_cores >= 8 else avail_cores - 1)
+
+        inter_threads = int(env_inter) if env_inter else 1
+
+        if env_compute:
+            compute_type = env_compute
+        elif self.device == "cuda":
+            compute_type = "float16"
+        else:
+            compute_type = "int8_float32"
+
+        print(f"[RealtimeStreamer] CTranslate2 config: device={self.device}, compute_type={compute_type}, "
+              f"cpu_threads={cpu_threads}/{avail_cores}, inter_threads={inter_threads}")
+
+        return {
+            "device": self.device,
+            "compute_type": compute_type,
+            "cpu_threads": cpu_threads,
+            "num_workers": inter_threads,
+        }
+
     def _ensure_model_loaded(self):
         """Load model + processor + ayah map if not already loaded."""
         if self._model is not None:
@@ -406,11 +439,8 @@ class RealtimeStreamer:
             if os.path.isdir(merged_local):
                 model_path = merged_local
                 print(f"[RealtimeStreamer] Loading merged model from {merged_local}...")
-                self._model = WhisperModel(
-                    merged_local if os.path.isdir(merged_local) else model_path,
-                    device="cpu",
-                    compute_type="int8",
-                )
+                ct2_params = self._get_ct2_threading_params()
+                self._model = WhisperModel(model_path, **ct2_params)
                 self._processor = None
                 self._forced_decoder_ids = None
                 self._is_faster_whisper = True
@@ -427,10 +457,12 @@ class RealtimeStreamer:
                 self._model = PeftModel.from_pretrained(base_model, adapter_path).to(self.device)
                 self._processor = WhisperProcessor.from_pretrained(base_path)
 
-            forced_decoder_ids = self._processor.get_decoder_prompt_ids(
-                language="arabic",
-                task="transcribe",
-            )
+            forced_decoder_ids = None
+            if self._processor is not None:
+                forced_decoder_ids = self._processor.get_decoder_prompt_ids(
+                    language="arabic",
+                    task="transcribe",
+                )
             lang_to_id = getattr(self._model.generation_config, "lang_to_id", None)
             if isinstance(lang_to_id, dict) and lang_to_id:
                 self._model.generation_config.language = "arabic"
@@ -469,18 +501,8 @@ class RealtimeStreamer:
         else:
             model_path = self._resolve_model_path(self._model_choice)
             print(f"[RealtimeStreamer] Loading model '{self._model_choice}' from {model_path}...")
-            # Detect available cores — use all minus 1 for OS on Pi 5, or 4 on laptop
-            import multiprocessing
-            available_cores = multiprocessing.cpu_count()
-            cpu_threads = max(1, available_cores - 1)  # leave 1 core for OS + VAD
-            print(f"[RealtimeStreamer] Using {cpu_threads}/{available_cores} CPU threads")
-            self._model = WhisperModel(
-                model_path,
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=cpu_threads,
-                num_workers=1,
-            )
+            ct2_params = self._get_ct2_threading_params()
+            self._model = WhisperModel(model_path, **ct2_params)
             self._processor = None
             self._forced_decoder_ids = None
             self._is_faster_whisper = True
@@ -898,16 +920,8 @@ class RealtimeStreamer:
                 guard_result.get("corrected_text") or analysis_text,
                 strip_basmala=strip_basmala_for_analysis,
             )
-            fully_cleared = self.correction_engine.consume_pending_match(recited_clean)
-            if fully_cleared:
-                guard_result["corrected_text"] = recited_clean
-                guard_result["display_text"] = recited_clean
-                guard_result["verdict"] = "ok"
-            else:
-                guard_result["corrected_text"] = recited_clean if recited_clean else ""
-                guard_result["display_text"] = guard_result["corrected_text"]
-                guard_result["verdict"] = "error"
-                guard_result["matched_key"] = None
+            guard_result["corrected_text"] = recited_clean if recited_clean else ""
+            guard_result["display_text"] = guard_result["corrected_text"]
 
         correction_verdict = guard_result.get("verdict", "unknown")
 
@@ -941,6 +955,7 @@ class RealtimeStreamer:
                 surah_num=effective_surah,
                 wrong_words=guard_result.get("wrong_words", []),
                 correction_spans=guard_result.get("correction_spans", []),
+                confidence=float(guard_result.get("confidence") or 1.0),
             )
             if correction_result["action"] == "pause":
                 self._vad_paused = True

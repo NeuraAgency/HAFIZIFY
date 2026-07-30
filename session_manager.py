@@ -84,14 +84,18 @@ SAMPLE_RATE = 16000
 # are detected as split points, so a 19-minute session gets broken into
 # individual ayah-length chunks instead of one giant speech segment that
 # exceeds Whisper's 30-second window.
-_VAD_MIN_SILENCE_MS      = 400     # ayah ke beech proper pause
-_VAD_MIN_SPEECH_MS       = 200     # short ayahs bhi pakad
-_VAD_THRESHOLD           = 0.25    # zyada sensitive — soft consonants miss na hon
-_VAD_END_PAD_MS          = 80      # OK — keep as is
-_VAD_MIN_CHUNK_DURATION  = 2.0     # was 0.3 — 2s minimum ensures Whisper has enough context
-_VAD_MAX_CHUNK_DURATION  = 8.0     # safety net — split any segment longer than 8s
-_VAD_RESCAN_INTERVAL     = 0.15    # OK — keep as is
-_VAD_TAIL_CONFIRM        = 0.15    # was 0.2 — faster ayah-end confirmation for quick transitions
+#
+# FIX: Increased from 180ms → 500ms to prevent mid-ayah choppiness.
+# Quran recitation has natural word-boundary pauses of 200–400ms.
+# A 180ms threshold was splitting mid-ayah, creating choppy ~4s chunks.
+_VAD_MIN_SILENCE_MS      = 500     # only split on ayah-boundary pauses (500ms+)
+_VAD_MIN_SPEECH_MS       = 150     # catch short ayahs promptly
+_VAD_THRESHOLD           = 0.25    # sensitive — soft consonants miss na hon
+_VAD_END_PAD_MS          = 80      # keep end padding
+_VAD_MIN_CHUNK_DURATION  = 2.0     # 2.0s minimum — prevents tiny choppy fragments
+_VAD_MAX_CHUNK_DURATION  = 15.0    # 15.0s safety net — VAD silence detection is the primary splitter
+_VAD_RESCAN_INTERVAL     = 0.15    # rescan interval
+_VAD_TAIL_CONFIRM        = 0.05    # 50ms tail confirmation for rapid emission
 
 
 @dataclass
@@ -169,9 +173,9 @@ class RecitationSession:
         if self.use_vad:
             try:
                 self._vad_model = load_silero_vad()
-                print(f"[Session {self.session_id}] ✅ Silero VAD loaded")
+                print(f"[Session {self.session_id}] [OK] Silero VAD loaded")
             except Exception as e:
-                print(f"[Session {self.session_id}] ⚠️ VAD init failed ({e}); falling back to fixed-time")
+                print(f"[Session {self.session_id}] [WARNING] VAD init failed ({e}); falling back to fixed-time")
                 self.use_vad = False
 
 
@@ -249,25 +253,39 @@ class RecitationSession:
         audio: np.ndarray,
         abs_start: int,
     ) -> List[Tuple[np.ndarray, int, int]]:
-        """Split a segment that exceeds _VAD_MAX_CHUNK_DURATION into smaller pieces.
+        """Split audio that exceeds _VAD_MAX_CHUNK_DURATION into smaller pieces.
 
-        Used as a safety net when a reciter speaks without pause for >25s.
-        Splits at natural 20s boundaries.
+        Uses energy-based splitting to find the best split point (lowest energy
+        region) rather than blindly cutting at the midpoint, which would
+        truncate words mid-syllable.
         """
         max_samples = int(_VAD_MAX_CHUNK_DURATION * SAMPLE_RATE)
         if len(audio) <= max_samples:
             return [(audio, abs_start, abs_start + len(audio))]
 
-        split_size = int(20.0 * SAMPLE_RATE)  # 20s pieces
         pieces = []
-        offset = 0
-        while offset < len(audio):
-            end = min(offset + split_size, len(audio))
-            piece = audio[offset:end]
-            pieces.append((piece, abs_start + offset, abs_start + end))
-            offset = end
-        print(f"[VAD] Long segment ({len(audio)/SAMPLE_RATE:.1f}s) split into {len(pieces)} piece(s)")
-        return pieces
+        pos = 0
+        while pos < len(audio):
+            end = min(pos + max_samples, len(audio))
+            if end < len(audio):
+                # Find the lowest-energy 50ms region around the split boundary
+                # to avoid cutting mid-word
+                search_start = max(pos, end - int(0.3 * SAMPLE_RATE))
+                search_end = min(len(audio), end + int(0.2 * SAMPLE_RATE))
+                window = int(0.05 * SAMPLE_RATE)  # 50ms window
+                best_split = end
+                best_energy = float("inf")
+                for candidate in range(search_start, search_end - window):
+                    energy = float(np.mean(audio[candidate:candidate + window] ** 2))
+                    if energy < best_energy:
+                        best_energy = energy
+                        best_split = candidate
+                end = best_split
+            piece = audio[pos:end]
+            if len(piece) >= int(_VAD_MIN_CHUNK_DURATION * SAMPLE_RATE):
+                pieces.append((piece, abs_start + pos, abs_start + end))
+            pos = end
+        return pieces if pieces else [(audio, abs_start, abs_start + len(audio))]
 
     def _emit_segment(
         self,
@@ -294,12 +312,18 @@ class RecitationSession:
             b, a = butter(2, 80.0 / (SAMPLE_RATE / 2), btype='high')
             chunk_audio = filtfilt(b, a, chunk_audio).astype(np.float32)
 
-        # Peak-normalise: cap near-clipping, boost quiet audio
-        max_amp = np.max(np.abs(chunk_audio))
-        if max_amp > 0.8:
-            chunk_audio = chunk_audio * (0.7 / max_amp)
-        elif 0 < max_amp < 0.9:
-            chunk_audio = chunk_audio * (0.9 / max_amp)
+        # Gentle RMS-based normalisation to a consistent level.
+        # Uses RMS (not peak) to avoid volume pumping between chunks.
+        # Target RMS = 0.12 (~-18dBFS) — comfortable listening level.
+        # Clamp gain to ±6dB to prevent extreme boosting/attenuation.
+        rms = float(np.sqrt(np.mean(chunk_audio ** 2)))
+        if rms > 1e-6:
+            target_rms = 0.12
+            gain = target_rms / rms
+            gain = max(0.5, min(2.0, gain))  # clamp to ±6dB
+            chunk_audio = chunk_audio * gain
+        # Hard limit to prevent clipping
+        np.clip(chunk_audio, -1.0, 1.0, out=chunk_audio)
 
         # Save WAV for debugging
         seg_wav = os.path.join(
@@ -439,6 +463,13 @@ class RecitationSession:
             self._next_chunk_start += self.step_size
         return ready_chunks
 
+    def skip_paused_audio(self):
+        """Commit/skip any audio accumulated while paused so it won't be chunked upon resuming."""
+        total_len = len(self._all_audio)
+        self._vad_committed_up_to = total_len
+        self._vad_scanned_up_to = total_len
+        self._next_chunk_start = total_len
+
     def flush_remaining_audio(self) -> List[tuple]:
         """Extract any remaining unprocessed audio when stopping the session.
 
@@ -521,6 +552,17 @@ class RecitationSession:
             "end_time_s": end_sample / SAMPLE_RATE,
         })
         return idx
+
+    def discard_pending_chunk(self, start_sample: int, end_sample: int) -> None:
+        """Remove a pending chunk entry without registering a result.
+        Used by the worker to drop stale chunks that were queued before
+        the Qari correction engine paused, so they don't corrupt state
+        after a correction has already started."""
+        target = start_sample / SAMPLE_RATE
+        for i, p in enumerate(self.pending_chunks):
+            if abs(p["start_time_s"] - target) < 0.05:
+                self.pending_chunks.pop(i)
+                return
 
     def register_chunk_result(
         self,

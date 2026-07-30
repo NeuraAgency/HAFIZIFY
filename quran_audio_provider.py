@@ -48,7 +48,9 @@ class QuranAudioProvider:
             f"{urllib.parse.quote(ayah_key)}?fields=url,segments,duration,verse_key"
         )
 
-        with urllib.request.urlopen(api_url, timeout=15) as response:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        req = urllib.request.Request(api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
 
         audio_files = payload.get("audio_files") or []
@@ -62,7 +64,9 @@ class QuranAudioProvider:
         if not audio_url:
             return None
 
-        urllib.request.urlretrieve(audio_url, audio_path)
+        audio_req = urllib.request.Request(audio_url, headers=headers)
+        with urllib.request.urlopen(audio_req, timeout=30) as resp, open(audio_path, "wb") as f_out:
+            f_out.write(resp.read())
         meta["audio_url"] = audio_url
         meta["audio_path"] = audio_path
 

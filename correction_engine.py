@@ -157,10 +157,10 @@ class CorrectionEngine:
 
             # Don't interrupt on isolated bad chunks — require 2 consecutive errors
             # AND sufficient confidence (low conf = garbled audio, not a real mistake)
-            if self._consecutive_errors < 2 or confidence < self._min_trigger_confidence:
+            if self._consecutive_errors < 1 or confidence < self._min_trigger_confidence:
                 self._notify("LISTENING")
                 return {"action": "warn", "state": "LISTENING",
-                        "message": f"خطأ محتمل (محاولة {self._consecutive_errors}/2)"}
+                        "message": f"خطأ محتمل"}
 
             self._consecutive_errors = 0
             self.correction_attempts = 0
