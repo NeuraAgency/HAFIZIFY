@@ -1,7 +1,7 @@
 """
 Groq Whisper Transcriber
 -------------------------
-Thin wrapper around the Groq REST API for the whisper-large-v3-turbo model.
+Thin wrapper around the Groq REST API for the whisper-large-v3 model.
 Handles both file-path inputs (upload tab) and raw in-memory numpy audio
 arrays (live streaming tab) by writing a temporary WAV to disk before
 sending to the API.
@@ -48,7 +48,7 @@ except ImportError:
             pass
 
 # No hardcoded default — API key must be set via GROQ_API_KEY env var
-_MODEL = "whisper-large-v3-turbo"
+_MODEL = "whisper-large-v3"
 _LANGUAGE = "ar"  # Arabic
 
 
@@ -66,7 +66,7 @@ def _write_wav_bytes(audio_np: np.ndarray, sample_rate: int = 16000) -> bytes:
 
 
 class GroqTranscriber:
-    """Wraps the Groq Audio Transcription API for whisper-large-v3-turbo."""
+    """Wraps the Groq Audio Transcription API for whisper-large-v3."""
 
     def __init__(self, api_key: str | None = None):
         if Groq is None:

@@ -141,16 +141,15 @@ MODEL_REGISTRY = {
         "hf": "OdyAsh/faster-whisper-base-ar-quran",
     },
     # ── Groq cloud ASR ────────────────────────────────────────────────────
-    "groq-whisper-large-v3-turbo": {
+    "groq-whisper-large-v3": {
         "type": "groq",
         # No local weights — always calls the Groq REST API
     },
 }
 
 MODEL_CHOICES = [
-    "whisper-base-quran-lora",
-    "faster-whisper-base-ar-quran",
-    "groq-whisper-large-v3-turbo",
+    "hafizify-base-quran-lora",
+    "groq-whisper-large-v3",
 ]
 _current_model_choice = None
 _model_type = "whisper"  # always whisper now
@@ -237,7 +236,7 @@ def load_models_once(model_choice="whisper-base-quran-lora"):
         processor = None
         _forced_decoder_ids = None
         _current_model_choice = model_choice
-        print(f"[Hafizify] Groq whisper-large-v3-turbo ready (cloud API).")
+        print(f"[Hafizify] Groq whisper-large-v3 ready (cloud API).")
         # Still load ayah map + surah detector
         ayah_path = os.path.join(BASE_DIR, "fyp_model", "all_ayat.json")
         lm_path = os.path.join(BASE_DIR, "quran_5gram.arpa")

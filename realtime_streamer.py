@@ -12,7 +12,7 @@ and correction pipelines. Handles:
 Supported models:
   - whisper-base-quran-lora      : LoRA fine-tuned on top of tarteel-ai base
   - whisper-medium-quran-full    : tarbiyah-ai fully merged Quran-trained whisper-medium
-  - groq-whisper-large-v3-turbo  : Cloud ASR via Groq API (fastest, no local GPU needed)
+  - groq-whisper-large-v3        : Cloud ASR via Groq API (fastest, no local GPU needed)
 """
 
 import os
@@ -322,7 +322,7 @@ class RealtimeStreamer:
             "adapter_hf": "omartariq612/quran-lora-whisper-medium-epoch-1",
         },
         # ── Groq cloud ASR ────────────────────────────────────────────────────
-        "groq-whisper-large-v3-turbo": {
+        "groq-whisper-large-v3": {
             "type": "groq",
             # No local path — always uses the Groq REST API
         },
@@ -408,8 +408,8 @@ class RealtimeStreamer:
             self._processor = None
             self._forced_decoder_ids = None
             self._is_faster_whisper = False
-            model_path = "groq-api:whisper-large-v3-turbo"
-            print(f"[RealtimeStreamer] Groq whisper-large-v3-turbo ready (cloud API).")
+            model_path = "groq-api:whisper-large-v3"
+            print(f"[RealtimeStreamer] Groq whisper-large-v3 ready (cloud API).")
             # Jump straight to shared post-load logic
             if os.path.isfile(self.ayah_json_path):
                 self._ayah_map = load_all_ayat_json(self.ayah_json_path)

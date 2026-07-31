@@ -88,10 +88,10 @@ SAMPLE_RATE = 16000
 # FIX: Increased from 180ms → 500ms to prevent mid-ayah choppiness.
 # Quran recitation has natural word-boundary pauses of 200–400ms.
 # A 180ms threshold was splitting mid-ayah, creating choppy ~4s chunks.
-_VAD_MIN_SILENCE_MS      = 500     # only split on ayah-boundary pauses (500ms+)
+_VAD_MIN_SILENCE_MS      = 300     # only split on ayah-boundary pauses (500ms+)
 _VAD_MIN_SPEECH_MS       = 150     # catch short ayahs promptly
 _VAD_THRESHOLD           = 0.25    # sensitive — soft consonants miss na hon
-_VAD_END_PAD_MS          = 80      # keep end padding
+_VAD_END_PAD_MS          = 100      # keep end padding
 _VAD_MIN_CHUNK_DURATION  = 1.5     # 1.5s — matches the anti-hallucination gate in realtime_streamer.py; used only as documentation of that downstream floor, NOT to merge across real pauses
 _VAD_NOISE_BLIP_DURATION = 0.6     # segments shorter than this are treated as VAD noise, not real ayahs — merge only these forward
 _VAD_MIN_EMIT_DURATION   = 0.3     # absolute floor to avoid emitting near-empty slivers; realtime_streamer's 1.5s gate does the real quality filtering
