@@ -92,7 +92,9 @@ _VAD_MIN_SILENCE_MS      = 500     # only split on ayah-boundary pauses (500ms+)
 _VAD_MIN_SPEECH_MS       = 150     # catch short ayahs promptly
 _VAD_THRESHOLD           = 0.25    # sensitive — soft consonants miss na hon
 _VAD_END_PAD_MS          = 80      # keep end padding
-_VAD_MIN_CHUNK_DURATION  = 2.0     # 2.0s minimum — prevents tiny choppy fragments
+_VAD_MIN_CHUNK_DURATION  = 1.5     # 1.5s — matches the anti-hallucination gate in realtime_streamer.py; used only as documentation of that downstream floor, NOT to merge across real pauses
+_VAD_NOISE_BLIP_DURATION = 0.6     # segments shorter than this are treated as VAD noise, not real ayahs — merge only these forward
+_VAD_MIN_EMIT_DURATION   = 0.3     # absolute floor to avoid emitting near-empty slivers; realtime_streamer's 1.5s gate does the real quality filtering
 _VAD_MAX_CHUNK_DURATION  = 15.0    # 15.0s safety net — VAD silence detection is the primary splitter
 _VAD_RESCAN_INTERVAL     = 0.15    # rescan interval
 _VAD_TAIL_CONFIRM        = 0.05    # 50ms tail confirmation for rapid emission
@@ -303,7 +305,7 @@ class RecitationSession:
         chunk_audio = self._all_audio[abs_start:padded_end].copy()
         chunk_audio = _apply_fade(chunk_audio, fade_ms=10)
 
-        if len(chunk_audio) < int(_VAD_MIN_CHUNK_DURATION * SAMPLE_RATE):
+        if len(chunk_audio) < int(_VAD_MIN_EMIT_DURATION * SAMPLE_RATE):
             return None
 
         # High-pass filter — remove DC offset & low-freq rumble (safe on full chunk)
@@ -322,7 +324,21 @@ class RecitationSession:
             gain = target_rms / rms
             gain = max(0.5, min(2.0, gain))  # clamp to ±6dB
             chunk_audio = chunk_audio * gain
-        # Hard limit to prevent clipping
+
+        # Soft limiter — smoothly compresses peaks above the knee instead of
+        # hard-clipping them flat. A hard np.clip introduces audible
+        # harshness/distortion on loud consonants when the RMS gain above
+        # pushes a transient over 1.0; this keeps everything below the knee
+        # untouched and only rounds off the very top of the waveform.
+        limiter_knee = 0.9
+        headroom = 1.0 - limiter_knee
+        over = np.abs(chunk_audio) > limiter_knee
+        if np.any(over):
+            sign = np.sign(chunk_audio[over])
+            excess = np.abs(chunk_audio[over]) - limiter_knee
+            chunk_audio[over] = sign * (limiter_knee + headroom * np.tanh(excess / headroom))
+        # Final safety net (tanh asymptotically approaches but never exceeds
+        # 1.0, so this should be a no-op in practice)
         np.clip(chunk_audio, -1.0, 1.0, out=chunk_audio)
 
         # Save WAV for debugging
@@ -350,20 +366,28 @@ class RecitationSession:
         _VAD_MIN_CHUNK_DURATION.  This prevents short speech bursts
         from being discarded, which was the main cause of choppy audio.
         """
-        min_dur = int(_VAD_MIN_CHUNK_DURATION * SAMPLE_RATE)
+        noise_blip = int(_VAD_NOISE_BLIP_DURATION * SAMPLE_RATE)
         pre_pad = int(0.15 * SAMPLE_RATE)
 
-        # ── Build groups by merging short segments with the next one ──
+        # ── Build groups ──
+        # IMPORTANT: every pair of consecutive VAD timestamps is, by construction,
+        # already separated by >= _VAD_MIN_SILENCE_MS of real silence (that's what
+        # min_silence_duration_ms means). Merging across that gap just to hit a
+        # duration floor re-splices legitimate ayah-boundary pauses back together —
+        # that was the source of the choppy/garbled chunks. We only merge a segment
+        # forward when IT ITSELF is a tiny noise blip (shorter than
+        # _VAD_NOISE_BLIP_DURATION), never just because the running group is short.
         groups: List[Tuple[int, int]] = []
         g_start = timestamps[0]["start"]
         g_end   = timestamps[0]["end"]
 
         for seg in timestamps[1:]:
-            if (g_end - g_start) >= min_dur:
-                # Current group is long enough → finalise it
+            if (g_end - g_start) >= noise_blip:
+                # Current group is a real segment on its own → finalise it
                 groups.append((g_start, g_end))
                 g_start = seg["start"]
-            # Extend (or start) the running group
+            # Otherwise the running group is just a noise blip — fold the next
+            # segment into it instead of emitting the blip alone.
             g_end = seg["end"]
         groups.append((g_start, g_end))  # last group
 
