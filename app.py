@@ -140,6 +140,11 @@ MODEL_REGISTRY = {
         "local": "faster-whisper-base-ar-quran",
         "hf": "OdyAsh/faster-whisper-base-ar-quran",
     },
+    "whisper-l-v3-turbo-quran-lora": {
+        "type": "whisper",
+        "local": "whisper-l-v3-turbo-quran-lora-dataset-mix",
+        "hf": "MaddoggProduction/whisper-l-v3-turbo-quran-lora-dataset-mix",
+    },
     # ── Groq cloud ASR ────────────────────────────────────────────────────
     "groq-whisper-large-v3": {
         "type": "groq",
@@ -148,7 +153,9 @@ MODEL_REGISTRY = {
 }
 
 MODEL_CHOICES = [
-    "hafizify-base-quran-lora",
+    "whisper-base-quran-lora",
+    "whisper-l-v3-turbo-quran-lora",
+    "faster-whisper-base-ar-quran",
     "groq-whisper-large-v3",
 ]
 _current_model_choice = None

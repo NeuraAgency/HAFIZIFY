@@ -326,6 +326,14 @@ class RealtimeStreamer:
             "type": "groq",
             # No local path — always uses the Groq REST API
         },
+        # ── Turbo Quran LoRA (harakat/tashkeel output) ─────────────────────────
+        # Full merged HF model (not an adapter) — loaded directly via
+        # WhisperForConditionalGeneration, no PEFT merge needed.
+        "whisper-l-v3-turbo-quran-lora": {
+            "type": "transformers_whisper",
+            "local": "whisper-l-v3-turbo-quran-lora-dataset-mix",
+            "hf": "MaddoggProduction/whisper-l-v3-turbo-quran-lora-dataset-mix",
+        },
     }
 
     def _resolve_model_path(self, model_choice: str) -> str:
@@ -937,6 +945,17 @@ class RealtimeStreamer:
             guard_result["display_text"] = guard_result["corrected_text"]
 
         correction_verdict = guard_result.get("verdict", "unknown")
+
+        # ── Turbo Quran LoRA: this model's whole purpose is preserving
+        # harakat/tashkeel, so skip the normalize_arabic-based correction
+        # pipeline for the DISPLAYED text only. Ayah matching/verdict above
+        # already ran (on its own internally-normalized copies), so surah
+        # progress, VAD, and everything else are unaffected — only what
+        # lands in the Chunk Details table changes.
+        if self._model_choice == "whisper-l-v3-turbo-quran-lora":
+            guard_result["raw_asr"] = raw_text
+            guard_result["corrected_text"] = raw_text
+            guard_result["display_text"] = raw_text
 
         guard_result["surah_lock_state"] = lock_state
         guard_result["_decode_time_s"] = round(decode_time, 3)

@@ -28,12 +28,22 @@ env/
 *.onnx
 *.msgpack
 *.h5
+*.tflite
+*.keras
+*.lite
+
+# ── New dual-stream harakat-fusion model option (downloaded, not source) ──────
+qdat_models/*.tflite
+qdat_models/*.keras
 
 # ── Exception: the small LoRA adapter (only ~2.4 MB — safe to commit) ─────────
 !whisper-base-quran-lora/adapter_model.safetensors
 
 # ── Exception: CT2 model binary (76 MB — converted LoRA, safe under 100 MB limit)
 !whisper-base-quran-lora-ct2/model.bin
+
+# ── Large fine-tuned/downloaded model directory (keep out of git) ──────────────
+whisper-l-v3-turbo-quran-lora-dataset-mix/
 
 # ── HuggingFace / model caches ─────────────────────────────────────────────────
 .cache/
