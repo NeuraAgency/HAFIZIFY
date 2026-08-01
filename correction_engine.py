@@ -3,27 +3,46 @@ Quran Interactive Correction Engine
 States: LISTENING → CORRECTING → VERIFYING → CONFIRMED/SKIPPED
 """
 import asyncio
+import difflib
 import threading
+import time
 import edge_tts
 import os
 import tempfile
 import pygame
 
+try:
+    from rapidfuzz import fuzz as _rfuzz_ce
+    _CE_HAS_RAPIDFUZZ = True
+except ImportError:
+    _rfuzz_ce = None
+    _CE_HAS_RAPIDFUZZ = False
+
 from fyp_model.quran_guard import normalize_arabic
 from quran_audio_provider import QuranAudioProvider
 
 VOICE = "ar-SA-HamedNeural"
-MAX_ATTEMPTS = 3
+
+
+def _words_close(a: str, b: str) -> bool:
+    """True if two normalized Arabic words are identical or a close ASR
+    near-miss (e.g. a single letter the model consistently confuses) —
+    same tolerance already used in realtime_streamer._token_close."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if _CE_HAS_RAPIDFUZZ:
+        return _rfuzz_ce.ratio(a, b) >= 72.0
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
 
 class CorrectionEngine:
     def __init__(self, on_state_change=None):
-        self.state = "LISTENING"  # LISTENING, CORRECTING, VERIFYING, CONFIRMED
-        self._consecutive_errors = 0      # require 2 errors in a row before interrupting
-        self._min_trigger_confidence = 0.30  # only interrupt if conf > this (avoids garbled chunks)
+        self.state = "LISTENING"  # LISTENING, CORRECTING, VERIFYING
+        self._min_trigger_confidence = 0.30  # ignore low-confidence/garbled chunks — not a real mistake
         self.current_ayah = None
         self.current_surah = None
         self.correction_attempts = 0
-        self.max_attempts = MAX_ATTEMPTS
         self.on_state_change = on_state_change  # callback for UI update
         
         # Full session tracking
@@ -124,7 +143,10 @@ class CorrectionEngine:
                 )
             
             elif self.state == "VERIFYING":
-                return self._handle_verifying(verdict, raw_asr, correct_ayah_text, wrong_words)
+                return self._handle_verifying(
+                    verdict, raw_asr, correct_ayah_text, wrong_words,
+                    confidence=confidence,
+                )
             
             return {"action": "continue", "state": self.state}
 
@@ -140,29 +162,24 @@ class CorrectionEngine:
     ) -> dict:
         if verdict == "ok":
             self.total_ok += 1
-            self._consecutive_errors = 0   # reset on success
             self._notify("LISTENING")
             return {"action": "continue", "state": "LISTENING"}
 
         elif verdict == "minor":
             self.total_minor += 1
-            self._consecutive_errors = 0   # minor is OK, reset counter
             self._notify("LISTENING")
             return {"action": "warn", "state": "LISTENING",
                     "message": "تحسين بسيط مطلوب"}
 
         elif verdict == "error":
             self.total_errors += 1
-            self._consecutive_errors += 1
 
-            # Don't interrupt on isolated bad chunks — require 2 consecutive errors
-            # AND sufficient confidence (low conf = garbled audio, not a real mistake)
-            if self._consecutive_errors < 1 or confidence < self._min_trigger_confidence:
+            # Ignore low-confidence/garbled chunks — not a real recitation mistake
+            if confidence < self._min_trigger_confidence:
                 self._notify("LISTENING")
                 return {"action": "warn", "state": "LISTENING",
                         "message": f"خطأ محتمل"}
 
-            self._consecutive_errors = 0
             self.correction_attempts = 0
             self._correction_id += 1
             correction_id = self._correction_id
@@ -196,63 +213,55 @@ class CorrectionEngine:
                     "message": "خطأ — صحح الكلمة"}
 
     # ─── VERIFYING state ───────────────────────────────────
-    def _handle_verifying(self, verdict, raw_asr, correct_ayah_text, wrong_words) -> dict:
-        if verdict == "ok":
+    def _handle_verifying(self, verdict, raw_asr, correct_ayah_text, wrong_words, confidence: float = 1.0) -> dict:
+        # Ignore low-confidence/garbled chunks (background noise, ASR
+        # hallucinations on silence, etc.) — they aren't a real correction
+        # attempt, so don't count them as "still wrong" and don't replay TTS.
+        if confidence < self._min_trigger_confidence:
+            return {"action": "continue", "state": "VERIFYING",
+                    "message": "بانتظار المحاولة"}
+
+        if verdict in ("ok", "minor"):
+            self.total_ok += 1
             if self.error_history:
                 self.error_history[-1]["resolved"] = True
                 self.error_history[-1]["attempts"] = self.correction_attempts
-            
+
             self._correction_id += 1
             self.correction_attempts = 0
             self._pending_wrong_words = []
             self._pending_corrections = []
             self.state = "LISTENING"
             self._notify("LISTENING")
-            
+
             threading.Thread(
-                target=self.speak, 
+                target=self.speak,
                 args=("أحسنت",),
                 daemon=True
             ).start()
-            
+
             return {"action": "continue", "state": "LISTENING",
                     "message": "أحسنت — تابع"}
 
-        else:
-            self.correction_attempts += 1
-            
-            if self.correction_attempts > self.max_attempts:
-                if self.error_history:
-                    self.error_history[-1]["skipped"] = True
-                    self.error_history[-1]["attempts"] = self.correction_attempts
-                self.skipped_ayahs.append(self.current_ayah)
-                self._correction_id += 1
-                self.correction_attempts = 0
-                self.state = "LISTENING"
-                self._notify("LISTENING")
-                
-                threading.Thread(
-                    target=self._speak_words_and_continue,
-                    args=(list(self._pending_corrections),),
-                    daemon=True
-                ).start()
-                
-                return {"action": "skip", "state": "LISTENING",
-                        "message": "تابع — سنمر للآية التالية"}
-            else:
-                self._correction_id += 1
-                correction_id = self._correction_id
-                self.state = "CORRECTING"
-                self._notify("CORRECTING")
-                threading.Thread(
-                    target=self._speak_words_and_verify,
-                    args=(list(self._pending_corrections), correction_id),
-                    daemon=True
-                ).start()
-                
-                return {"action": "retry", "state": "CORRECTING",
-                        "attempts_left": self.max_attempts - self.correction_attempts + 1,
-                        "message": f"حاول مرة أخرى — {self.max_attempts - self.correction_attempts + 1} محاولات متبقية"}
+        # Still wrong — replay the correction and keep listening. The reciter
+        # cannot move on to the next ayah until this one is said correctly.
+        self.correction_attempts += 1
+        if self.error_history:
+            self.error_history[-1]["attempts"] = self.correction_attempts
+
+        self._correction_id += 1
+        correction_id = self._correction_id
+        self.state = "CORRECTING"
+        self._notify("CORRECTING")
+        threading.Thread(
+            target=self._speak_words_and_verify,
+            args=(list(self._pending_corrections), correction_id),
+            daemon=True
+        ).start()
+
+        return {"action": "retry", "state": "CORRECTING",
+                "attempts": self.correction_attempts,
+                "message": "حاول مرة أخرى"}
 
     # ─── Helpers ───────────────────────────────────────────
     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):
@@ -264,21 +273,16 @@ class CorrectionEngine:
                         self.speak(word)
         except Exception as exc:
             print(f"[CorrectionEngine] Correction audio failed, continuing silently: {exc}")
+
+        # Brief pause after the correction finishes playing, before we start
+        # listening again, so the reciter isn't cut off mid-breath.
+        time.sleep(0.2)
+
         with self._state_lock:
             if correction_id != self._correction_id or self.state != "CORRECTING":
                 return
             self.state = "VERIFYING"
             self._notify("VERIFYING")
-
-    def _speak_words_and_continue(self, corrections: list[dict]):
-        try:
-            for correction in corrections:
-                if not self._play_quran_correction(correction):
-                    word = correction.get("text", "")
-                    if word:
-                        self.speak(word)
-        except Exception as exc:
-            print(f"[CorrectionEngine] Skip audio failed, continuing silently: {exc}")
 
     def _build_pending_corrections(self, wrong_words: list, correction_spans: list[dict]) -> list[dict]:
         corrections: list[dict] = []
@@ -350,30 +354,42 @@ class CorrectionEngine:
             return list(self._pending_wrong_words)
 
     def consume_pending_match(self, recited_text: str) -> bool:
+        """Check the just-recited text against the specific phrase(s) that
+        were flagged wrong, using the same near-miss tolerance the normal
+        listening pipeline already applies — an exact-only comparison would
+        reject a correct retry any time the ASR mishears the same letter
+        again, which happens often (e.g. ص heard as س)."""
         with self._state_lock:
             norm_recited = normalize_arabic(recited_text)
             if not norm_recited:
                 return False
 
+            recited_words = norm_recited.split()
             new_pending: list[str] = []
             matched = False
-            recited_words = norm_recited.split()
+
+            def _sequence_close(a_words: list[str], b_words: list[str]) -> bool:
+                if not a_words or len(a_words) != len(b_words):
+                    return False
+                return all(_words_close(a, b) for a, b in zip(a_words, b_words))
 
             for phrase in self._pending_wrong_words:
                 norm_phrase = normalize_arabic(phrase)
                 phrase_words = norm_phrase.split()
+
                 phrase_in_recited = any(
-                    recited_words[i : i + len(phrase_words)] == phrase_words
+                    _sequence_close(phrase_words, recited_words[i : i + len(phrase_words)])
                     for i in range(0, max(0, len(recited_words) - len(phrase_words)) + 1)
                 ) if phrase_words else False
 
-                if norm_phrase == norm_recited or phrase_in_recited:
+                if _sequence_close(phrase_words, recited_words) or phrase_in_recited:
                     matched = True
                     continue
 
                 remaining_words: list[str] = []
                 for word in phrase.split():
-                    if normalize_arabic(word) in recited_words:
+                    norm_word = normalize_arabic(word)
+                    if any(_words_close(norm_word, rw) for rw in recited_words):
                         matched = True
                         continue
                     remaining_words.append(word)

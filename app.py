@@ -189,12 +189,13 @@ def _process_queue_worker():
 
             chunk_audio, chunk_start, chunk_end = chunk_tuple
 
-            # If Qari mode is mid-correction (not LISTENING), this chunk was
-            # queued from audio recited BEFORE the correction was heard.
-            # Processing it now would corrupt the Qari's state machine and
-            # make it look like the ASR "moved on" while Qari is stuck.
-            # Drop it instead.
-            if qari_mode and rt_streamer.correction_engine.state != "LISTENING":
+            # Only audio captured WHILE the correction TTS is playing
+            # (state == CORRECTING) is stale — that's the reciter's audio
+            # from before they heard the correction. Once state reaches
+            # VERIFYING, the mic has reopened specifically to listen for the
+            # reciter's correction attempt, so that chunk must be processed
+            # or the Qari state machine can never advance past VERIFYING.
+            if qari_mode and rt_streamer.correction_engine.state == "CORRECTING":
                 session.discard_pending_chunk(chunk_start, chunk_end)
                 print(f"[Worker] Dropped stale chunk (Qari state={rt_streamer.correction_engine.state})")
                 continue

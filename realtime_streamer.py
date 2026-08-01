@@ -851,7 +851,20 @@ class RealtimeStreamer:
 
         effective_surah = session.surah if session.surah is not None else lock_surah
 
-        if qari_mode:
+        if qari_mode and correction_state == "VERIFYING" and self.correction_engine.get_pending_corrections():
+            # During verification we only care whether the specific mistake
+            # that triggered the correction has now been said correctly —
+            # not whether the whole ayah was re-recited from scratch. Long
+            # ayahs get split across multiple VAD chunks, so requiring a
+            # full-ayah match here would reject a perfectly correct retry
+            # of just the flagged phrase.
+            corrected_now = self.correction_engine.consume_pending_match(analysis_text)
+            guard_result["corrected_text"] = analysis_text
+            guard_result["display_text"] = analysis_text
+            guard_result["verdict"] = "ok" if corrected_now else "error"
+            guard_result["wrong_words"] = []
+            guard_result["correction_spans"] = []
+        elif qari_mode:
             ref_text = guard_result.get("matched_ayah_text") or ""
             wrong_words = []
             correction_spans = []
