@@ -123,6 +123,8 @@ class ChunkResult:
     matched_ayah_text: Optional[str] = None
     errors: List[Dict[str, str]] = field(default_factory=list)
     surah_lock_state: Optional[Dict[str, Any]] = None
+    harakaat_errors: Optional[list] = None
+    harakaat_error_count: int = 0
 
 
 @dataclass
@@ -670,6 +672,8 @@ class RecitationSession:
             chunk_wav_path=chunk_wav_path,
             errors=errors,
             surah_lock_state=surah_lock_state,
+            harakaat_errors=guard_result.get("harakaat_errors"),
+            harakaat_error_count=guard_result.get("harakaat_error_count", 0),
         )
 
         self.chunk_results.append(result)
@@ -861,6 +865,8 @@ class RecitationSession:
                     "chunk_wav": r.chunk_wav_path,
                     "errors": r.errors,
                     "surah_lock_state": r.surah_lock_state,
+                    "harakaat_errors": r.harakaat_errors,
+                    "harakaat_error_count": r.harakaat_error_count,
                 }
                 for r in self.chunk_results
             ],

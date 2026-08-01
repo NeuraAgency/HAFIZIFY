@@ -7,6 +7,8 @@ Colors:
   ⚠️  Amber  (#f59e0b) — minor error (>70% character similarity)
   ❌ Red    (#ef4444) — major error (<70% similarity)
   ⬜ Gray   (#9ca3af) — low confidence (<0.4)
+  🟡 Gold   (#eab308) — harakaat (vowel-only) mistake, Combined Mode only
+     (masterplan.md §4.5 / Phase 6) — consonants correct, diacritics wrong
 """
 
 import json
@@ -31,6 +33,13 @@ COLORS = {
     "major": "#ef4444",     # red — also used as "wrong" in the simplified display
     "uncertain": "#9ca3af", # gray
     "pending": "#94a3b8",   # gray — not yet reached / capped by an earlier mistake
+    "harakaat": "#eab308",  # gold — vowel-only mistake, Combined Mode only
+                             # (masterplan.md §4.5 / Phase 6). Deliberately a
+                             # different shade from "minor" (also amber-ish)
+                             # so the two aren't visually confused — a
+                             # harakaat mistake is a diacritic slip on an
+                             # otherwise-correct word, not a character-level
+                             # mismatch.
 }
 
 _TAWWUZ_TEXT = "أعوذ بالله من الشيطان الرجيم"
@@ -426,13 +435,46 @@ class LiveDisplayFormatter:
         if confidence is not None and confidence < CONFIDENCE_UNCERTAIN_THRESHOLD:
             word_classes = ["correct" if c == "correct" else "uncertain" for c in word_classes]
 
+        # Overlay harakaat (vowel-only) mistakes as a distinct gold highlight
+        # — masterplan.md §4.5 (Phase 6). Only fires when harakaat_errors is
+        # non-empty on chunk_result; standard mode chunks never populate that
+        # field, so this branch is a no-op there and existing green/amber/red/
+        # gray output is unaffected.
+        #
+        # Matched by normalized word TEXT, not the detector's word index:
+        # harakaat_error_detector runs against the full pre-invocation-strip
+        # decode, while corrected_text here is built from the post-strip
+        # analysis text, so the two can be offset by a few words (e.g. the
+        # session-opening chunk that strips a leading Basmala) — index
+        # alignment isn't safe across that boundary, text matching is.
+        # Trade-off: if the same word appears more than once in the ayah and
+        # only one occurrence was flagged, every occurrence gets highlighted
+        # here, not just the flagged one — acceptable since this is a review
+        # cue (see CorrectionEngine._handle_harakaat_hint), not a score.
+        harakaat_errors = chunk_result.get("harakaat_errors") or []
+        if harakaat_errors:
+            harakaat_norm_words = {
+                _normalize(h.get("predicted") or "")
+                for h in harakaat_errors
+                if h.get("predicted")
+            }
+            for k in range(len(word_classes)):
+                if word_classes[k] == "correct" and norm_rec[k] in harakaat_norm_words:
+                    word_classes[k] = "harakaat"
+
         # Build HTML spans
         spans = []
         for i, word in enumerate(recited_words):
             cls = word_classes[i]
-            color = COLORS[cls]
+            color = COLORS.get(cls, COLORS["major"])
+            # "harakaat" is a display-only overlay on top of an otherwise
+            # "correct" (consonant-correct) word — count it as correct in the
+            # running stats, since the underlying word/stats vocabulary here
+            # doesn't have a harakaat bucket and this is a review cue, not an
+            # error tally.
+            stats_cls = "correct" if cls == "harakaat" else cls
             self._stats["total_words"] += 1
-            self._stats[cls] += 1
+            self._stats[stats_cls] += 1
             spans.append(self._word_span(word, color))
 
         return " ".join(spans)

@@ -192,6 +192,82 @@ def _correction_span_from_annotations(annotations, start_idx: int, end_idx: int)
     }
 
 
+def _apply_qari_word_scoring(guard_result: dict, analysis_text: str) -> None:
+    """Qari Mode word-level teachable-phrase scoring for Combined Mode
+    (masterplan.md changelog, 2026-08-02 — wiring qari_mode into
+    process_chunk_combined()).
+
+    Mirrors process_chunk()'s qari_mode branch so Combined Mode gets the
+    same wrong-word/correction-span behavior Standard Qari Mode already
+    has. Lives as its own function rather than being extracted out of
+    process_chunk() because process_chunk()'s body is on masterplan.md's
+    "do not touch" list (§5) — this is a fresh copy for the new caller,
+    not a refactor of the existing one. Mutates guard_result in place.
+    """
+    ref_text = guard_result.get("matched_ayah_text") or ""
+    wrong_words = []
+    correction_spans = []
+    if ref_text:
+        hyp_text = correct_text_rules(analysis_text, mode="balanced")
+        detection_text = _strip_trailing_partial_token(hyp_text, ref_text)
+        annotations = get_word_error_annotations(detection_text, ref_text, confidence=None)
+        annotations = _drop_trailing_future_missing(annotations)
+        statuses = {a.get("status") for a in annotations}
+        minor_fixed_text = _apply_minor_reference_fixes(annotations)
+        if minor_fixed_text:
+            guard_result["corrected_text"] = minor_fixed_text
+            guard_result["display_text"] = minor_fixed_text
+        elif hyp_text:
+            guard_result["corrected_text"] = hyp_text
+            guard_result["display_text"] = hyp_text
+
+        first_teachable_idx = next(
+            (
+                i
+                for i, a in enumerate(annotations)
+                if a.get("status") in ("major", "missing")
+                and a.get("reference")
+            ),
+            None,
+        )
+        if first_teachable_idx is not None:
+            phrase_parts = []
+            phrase_start_idx = first_teachable_idx
+            for i, ann in enumerate(annotations[first_teachable_idx:], first_teachable_idx):
+                if i > first_teachable_idx and ann.get("status") == "correct":
+                    break
+                status = ann.get("status")
+                ref_word = ann.get("reference")
+                if status in ("major", "missing") and ref_word:
+                    phrase_parts.append(ref_word)
+                    continue
+                if status not in ("extra", "uncertain") and phrase_parts:
+                    wrong_words.append(" ".join(phrase_parts))
+                    correction_spans.append(
+                        _correction_span_from_annotations(annotations, phrase_start_idx, i - 1)
+                    )
+                    phrase_parts = []
+            if phrase_parts:
+                wrong_words.append(" ".join(phrase_parts))
+                correction_spans.append(
+                    _correction_span_from_annotations(
+                        annotations,
+                        phrase_start_idx,
+                        min(len(annotations) - 1, phrase_start_idx + len(phrase_parts) - 1),
+                    )
+                )
+
+        if statuses - {"correct", "minor", None}:
+            guard_result["verdict"] = "error"
+        elif "minor" in statuses:
+            guard_result["verdict"] = "minor"
+        elif statuses:
+            guard_result["verdict"] = "ok"
+
+    guard_result["wrong_words"] = wrong_words
+    guard_result["correction_spans"] = correction_spans
+
+
 def _force_expected_ayah_if_behind(guard_result: dict, session: RecitationSession, ayah_map) -> None:
     expected_ayah = getattr(session, "current_ayah", None)
     surah = getattr(session, "surah", None)
@@ -996,6 +1072,183 @@ class RealtimeStreamer:
         else:
             self._vad_paused = False
             
+        return result
+
+    def process_chunk_combined(
+        self,
+        session: RecitationSession,
+        chunk_audio: np.ndarray,
+        correction_mode: str = "balanced",
+        chunk_start_sample: int = None,
+        chunk_end_sample: int = None,
+        qari_mode: bool = False,
+    ) -> ChunkResult:
+        """Combined Model mode sibling of process_chunk() — masterplan.md §4.2 (Phase 3).
+
+        Decodes via hybrid_diacritic_pipeline (Groq consonant backbone + local
+        turbo diacritics) instead of the single offline model, runs the same
+        guard_inference ayah-matching/correction pipeline process_chunk() uses,
+        and additionally runs harakaat_error_detector against the matched
+        ayah's diacritized reference text. process_chunk() itself is untouched;
+        this is a new, separate function.
+
+        qari_mode (masterplan.md changelog, 2026-08-02): when True, also runs
+        Qari Mode word-level scoring (_apply_qari_word_scoring) and hands the
+        verdict + harakaat_errors to self.correction_engine.process_verdict(),
+        the same way process_chunk()'s qari_mode branch already does for
+        Standard Mode. Without this, Combined Mode's harakaat_errors were
+        computed but never reached the correction engine, and
+        CorrectionEngine._handle_harakaat_hint() was unreachable.
+        """
+        # Lazy imports — Combined Mode's local turbo model and Groq client are
+        # only touched when this function actually runs, per masterplan §3.1.
+        from hybrid_diacritic_pipeline import run_combined_transcription
+        from harakaat_error_detector import detect_harakaat_errors
+
+        t0 = time.time()
+
+        # --- Anti-hallucination gate (same thresholds as process_chunk) ---
+        chunk_rms = float(np.sqrt(np.mean(chunk_audio.astype(np.float32) ** 2)))
+        chunk_duration = len(chunk_audio) / SAMPLE_RATE
+        if chunk_duration < 1.5 or chunk_rms < _MIN_SPEECH_RMS:
+            print(f"[Chunk-Combined] Skipped — duration={chunk_duration:.2f}s, RMS={chunk_rms:.4f}")
+            return session.register_chunk_result(
+                chunk_audio,
+                {"corrected_text": "", "verdict": "skipped", "confidence": 0.0,
+                 "raw_asr": "", "_skip_reason": f"rms={chunk_rms:.4f} dur={chunk_duration:.2f}s"},
+                None, None,
+                chunk_start_sample=chunk_start_sample,
+                chunk_end_sample=chunk_end_sample,
+            )
+
+        # 1. Combined decode — diacritized text (masterplan §4.2 step 2)
+        decode_result = run_combined_transcription(chunk_audio.astype(np.float32), SAMPLE_RATE)
+        raw_text = decode_result["combined_text"]
+        decode_time = time.time() - t0
+        detection_text = _strip_leading_invocations(raw_text, strip_basmala=True)
+
+        # 2. Rolling-window surah detection — same mechanism as process_chunk
+        if not hasattr(session, "_detection_buffer"):
+            session._detection_buffer = []
+        if detection_text and len(detection_text.split()) >= 2:
+            session._detection_buffer.append(detection_text.strip())
+            session._detection_buffer = session._detection_buffer[-8:]
+        accumulated_text = "  ".join(session._detection_buffer)
+
+        lock_state = None
+        lock_surah = None
+        if (session.surah is None
+                and self._surah_detector is not None
+                and getattr(session, "surah_lock_manager", None)
+                and len(session._detection_buffer) >= 2):
+            candidates = self._surah_detector.detect(accumulated_text, top_k=5)
+            lock_state = session.surah_lock_manager.update(candidates)
+            session.surah_lock_state = lock_state
+            if lock_state:
+                lock_surah = lock_state.get("locked_surah")
+
+        effective_surah = session.surah if session.surah is not None else lock_surah
+
+        strip_basmala_for_analysis = not (
+            effective_surah == 1 and (session.current_ayah is None or session.current_ayah <= 1)
+        )
+        analysis_text = _strip_leading_invocations(raw_text, strip_basmala=strip_basmala_for_analysis)
+        if raw_text and not analysis_text:
+            return session.register_chunk_result(
+                chunk_audio,
+                {"corrected_text": "", "verdict": "skipped", "confidence": 0.0,
+                 "raw_asr": raw_text, "_skip_reason": "leading_invocation_only"},
+                None, lock_state,
+                chunk_start_sample=chunk_start_sample,
+                chunk_end_sample=chunk_end_sample,
+            )
+
+        # 3. Existing guard pipeline for ayah matching/correction — unchanged
+        #    (masterplan §4.2 step 3; same call shape as process_chunk's non-strict path)
+        guard_result = guard_inference(
+            raw_text=analysis_text,
+            ayah_map=self._ayah_map,
+            surah=effective_surah,
+            expected_ayah=session.current_ayah,
+            lookahead=10,
+            window_back=5,
+            correction_mode="aggressive" if correction_mode == "balanced" else correction_mode,
+            allow_auto_correct=True,
+            allow_reference_replacement=True,
+            preserve_reciter=True,
+            use_sequence_match=True,
+            sequence_max_ayahs=8,
+            lock_surah=lock_surah if session.surah is None else None,
+        )
+
+        # 3b. Qari Mode word-level scoring (masterplan.md changelog, 2026-08-02)
+        #     Mirrors process_chunk()'s qari_mode branch via _apply_qari_word_scoring
+        #     so wrong_words/correction_spans/verdict feed the correction engine
+        #     the same way they do in Standard Mode.
+        correction_state = self.correction_engine.state if qari_mode else "LISTENING"
+        if qari_mode and correction_state == "VERIFYING" and self.correction_engine.get_pending_corrections():
+            corrected_now = self.correction_engine.consume_pending_match(analysis_text)
+            guard_result["corrected_text"] = analysis_text
+            guard_result["display_text"] = analysis_text
+            guard_result["verdict"] = "ok" if corrected_now else "error"
+            guard_result["wrong_words"] = []
+            guard_result["correction_spans"] = []
+        elif qari_mode:
+            _apply_qari_word_scoring(guard_result, analysis_text)
+
+        # 4. Harakaat error detection against the matched ayah's diacritized
+        #    reference — new in Combined Mode (masterplan §4.2 step 4 / §3.2)
+        matched_key = guard_result.get("matched_key")
+        if isinstance(matched_key, (tuple, list)) and len(matched_key) >= 2:
+            harakaat_result = detect_harakaat_errors(raw_text, int(matched_key[0]), int(matched_key[1]))
+            guard_result["harakaat_errors"] = [
+                {"index": w.index, "predicted": w.predicted_word, "reference": w.reference_word, "status": w.status}
+                for w in harakaat_result.words if w.status == "harakaat_error"
+            ]
+            guard_result["harakaat_error_count"] = harakaat_result.harakaat_error_count
+
+        guard_result["surah_lock_state"] = lock_state
+        guard_result["_decode_time_s"] = round(decode_time, 3)
+        guard_result["_chunk_duration_s"] = round(chunk_duration, 2)
+
+        result = session.register_chunk_result(
+            chunk_audio, guard_result, None, lock_state,
+            chunk_start_sample=chunk_start_sample,
+            chunk_end_sample=chunk_end_sample,
+        )
+
+        print(
+            f"[Chunk-Combined {result.chunk_index}] "
+            f"decode={decode_time:.2f}s | "
+            f"raw='{raw_text[:50]}' | "
+            f"verdict={result.verdict} | "
+            f"harakaat_errors={guard_result.get('harakaat_error_count', 0)} | "
+            f"surah={effective_surah}"
+        )
+
+        # Qari Mode dispatch (masterplan.md changelog, 2026-08-02) — same
+        # call shape as process_chunk()'s qari_mode branch, now including
+        # harakaat_errors so CorrectionEngine._handle_harakaat_hint() can
+        # actually fire for Combined Mode.
+        if qari_mode:
+            correction_result = self.correction_engine.process_verdict(
+                verdict=guard_result.get("verdict", "unknown"),
+                raw_asr=raw_text,
+                correct_ayah_text=guard_result.get("matched_ayah_text", ""),
+                ayah_num=guard_result.get("matched_ayah"),
+                surah_num=effective_surah,
+                wrong_words=guard_result.get("wrong_words", []),
+                correction_spans=guard_result.get("correction_spans", []),
+                confidence=float(guard_result.get("confidence") or 1.0),
+                harakaat_errors=guard_result.get("harakaat_errors"),
+            )
+            if correction_result["action"] == "pause":
+                self._vad_paused = True
+            elif correction_result["action"] in ("continue", "skip"):
+                self._vad_paused = False
+        else:
+            self._vad_paused = False
+
         return result
 
     def decode_full_session(

@@ -127,10 +127,16 @@ class CorrectionEngine:
         wrong_words: list[str] | None = None,
         correction_spans: list[dict] | None = None,
         confidence: float = 1.0,
+        harakaat_errors: list | None = None,
     ) -> dict:
         """
         Call this after every chunk is processed.
         Returns dict with action to take.
+
+        harakaat_errors (masterplan.md §4.4 / Phase 5): optional, only ever
+        populated by Combined Mode chunks. When None (standard mode, or a
+        Combined Mode chunk with no vowel slips), behavior here is 100%
+        unchanged from before this param existed.
         """
         with self._state_lock:
             self.current_ayah = ayah_num
@@ -139,7 +145,7 @@ class CorrectionEngine:
             if self.state == "LISTENING":
                 return self._handle_listening(
                     verdict, raw_asr, correct_ayah_text, wrong_words, correction_spans,
-                    confidence=confidence,
+                    confidence=confidence, harakaat_errors=harakaat_errors,
                 )
             
             elif self.state == "VERIFYING":
@@ -159,14 +165,19 @@ class CorrectionEngine:
         wrong_words,
         correction_spans=None,
         confidence: float = 1.0,
+        harakaat_errors: list | None = None,
     ) -> dict:
         if verdict == "ok":
             self.total_ok += 1
+            if harakaat_errors:
+                return self._handle_harakaat_hint(harakaat_errors)
             self._notify("LISTENING")
             return {"action": "continue", "state": "LISTENING"}
 
         elif verdict == "minor":
             self.total_minor += 1
+            if harakaat_errors:
+                return self._handle_harakaat_hint(harakaat_errors)
             self._notify("LISTENING")
             return {"action": "warn", "state": "LISTENING",
                     "message": "تحسين بسيط مطلوب"}
@@ -262,6 +273,29 @@ class CorrectionEngine:
         return {"action": "retry", "state": "CORRECTING",
                 "attempts": self.correction_attempts,
                 "message": "حاول مرة أخرى"}
+
+    # ─── HARAKAAT_HINT (masterplan.md §4.4 / Phase 5) ─────
+    def _handle_harakaat_hint(self, harakaat_errors: list) -> dict:
+        """Lightweight sibling reaction to vowel-only (harakaat) mistakes —
+        Combined Mode only. Does NOT use the strict consecutive-error gate
+        that CORRECTING/VERIFYING use for word (makhraj) errors: a single
+        vowel slip is a review note, not a stop-and-retry event. Plays a
+        short, distinct audio cue (different from the full ayah correction
+        TTS/audio) and returns to LISTENING immediately — no multi-attempt
+        verification loop."""
+        self._notify("HARAKAAT_HINT")
+        threading.Thread(
+            target=self.speak,
+            args=("انتبه للتشكيل",),
+            daemon=True,
+        ).start()
+        self._notify("LISTENING")
+        return {
+            "action": "hint",
+            "state": "LISTENING",
+            "message": "انتبه للتشكيل",
+            "harakaat_errors": harakaat_errors,
+        }
 
     # ─── Helpers ───────────────────────────────────────────
     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):

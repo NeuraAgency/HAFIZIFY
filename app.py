@@ -188,11 +188,15 @@ def _process_queue_worker():
             continue
 
         try:
-            if len(task) == 4:
+            if len(task) == 5:
+                session, chunk_tuple, correction_mode, qari_mode, asr_engine = task
+            elif len(task) == 4:
                 session, chunk_tuple, correction_mode, qari_mode = task
+                asr_engine = "standard"
             else:
                 session, chunk_tuple, correction_mode = task
                 qari_mode = False
+                asr_engine = "standard"
 
             chunk_audio, chunk_start, chunk_end = chunk_tuple
 
@@ -207,11 +211,18 @@ def _process_queue_worker():
                 print(f"[Worker] Dropped stale chunk (Qari state={rt_streamer.correction_engine.state})")
                 continue
 
-            rt_streamer.process_chunk(
-                session, chunk_audio, correction_mode=correction_mode,
-                qari_mode=qari_mode,
-                chunk_start_sample=chunk_start, chunk_end_sample=chunk_end,
-            )
+            if asr_engine == "combined":
+                rt_streamer.process_chunk_combined(
+                    session, chunk_audio, correction_mode=correction_mode,
+                    qari_mode=qari_mode,
+                    chunk_start_sample=chunk_start, chunk_end_sample=chunk_end,
+                )
+            else:
+                rt_streamer.process_chunk(
+                    session, chunk_audio, correction_mode=correction_mode,
+                    qari_mode=qari_mode,
+                    chunk_start_sample=chunk_start, chunk_end_sample=chunk_end,
+                )
         except Exception as e:
             print(f"[Worker] Error processing chunk: {e}")
         finally:
@@ -391,6 +402,16 @@ def _parse_surah_number(surah_str: str) -> Optional[int]:
         return int(surah_str.split(" - ")[0].strip())
     except (ValueError, IndexError):
         return None
+
+
+def _parse_asr_engine(engine_str: str) -> str:
+    """Map the 'ASR Engine' radio label to 'combined' or 'standard'.
+    Default is 'standard' for any unrecognized/empty value, so an existing
+    user who never touches this control gets byte-identical behavior
+    (masterplan.md §4.3)."""
+    if engine_str and engine_str.startswith("Combined"):
+        return "combined"
+    return "standard"
 
 
 # ---------------------------------------------------------------------------
@@ -720,7 +741,7 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
     )
 
 
-def process_streaming_audio(audio_data, correction_mode, qari_mode):
+def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine):
     """Called by Gradio's streaming mic with each audio fragment.
 
     audio_data is a tuple (sample_rate, numpy_array) from Gradio.
@@ -846,7 +867,7 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode):
     for chunk_tuple in ready_chunks:
         chunk_audio, chunk_start, chunk_end = chunk_tuple
         session_ref.register_pending_chunk(chunk_start, chunk_end)
-        _chunk_queue.put((session_ref, chunk_tuple, correction_mode, qari_mode))
+        _chunk_queue.put((session_ref, chunk_tuple, correction_mode, qari_mode, _parse_asr_engine(asr_engine)))
 
     # Build color-coded merged HTML display
     chunk_dicts = session_ref.get_chunk_results_as_dicts()
@@ -983,7 +1004,7 @@ def _build_live_ui_snapshot(session):
     return expected_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed, badge_html
 
 
-def stop_live_session(correction_mode, qari_mode):
+def stop_live_session(correction_mode, qari_mode, asr_engine):
     """Drain the queue (yielding updates), then return all 13 UI outputs with full results."""
     global _active_session
 
@@ -1005,7 +1026,7 @@ def stop_live_session(correction_mode, qari_mode):
         for chunk_tuple in remaining:
             chunk_audio, chunk_start, chunk_end = chunk_tuple
             session.register_pending_chunk(chunk_start, chunk_end)
-            _chunk_queue.put((session, chunk_tuple, correction_mode, qari_mode))
+            _chunk_queue.put((session, chunk_tuple, correction_mode, qari_mode, _parse_asr_engine(asr_engine)))
         print(f"[Session] {len(remaining)} final chunk(s) queued; waiting for ALL chunks…")
 
         # ---- 2. Yield updates while worker processes remaining chunks ----
@@ -1191,6 +1212,15 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             value="whisper-base-quran-lora",
                             label="🤖 ASR Model",
                         )
+                        live_asr_engine_selector = gr.Radio(
+                            choices=[
+                                "Standard (offline, fast)",
+                                "Combined (Groq + Local, harakaat-aware, needs internet)",
+                            ],
+                            value="Standard (offline, fast)",
+                            label="⚙️ ASR Engine",
+                            info="Combined Mode: requires internet + GPU, more accurate diacritics.",
+                        )
                         surah_dropdown = gr.Dropdown(
                             choices=SURAH_NAMES,
                             value="1 - Al-Fatiha",
@@ -1333,13 +1363,13 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
 
             mic_input.stream(
                 fn=process_streaming_audio,
-                inputs=[mic_input, live_correction_mode, qari_mode_checkbox],
+                inputs=[mic_input, live_correction_mode, qari_mode_checkbox, live_asr_engine_selector],
                 outputs=[live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html, correction_status_box],
             )
 
             stop_btn.click(
                 fn=stop_live_session,
-                inputs=[live_correction_mode, qari_mode_checkbox],
+                inputs=[live_correction_mode, qari_mode_checkbox, live_asr_engine_selector],
                 outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
                          corrected_box, chunks_table_md, comparison_md,
                          session_eval_json, guessed_surah_box, surah_badge_html, session_audio_output, correction_status_box],
