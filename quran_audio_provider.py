@@ -84,23 +84,34 @@ class QuranAudioProvider:
         if start_word_index is None or end_word_index is None:
             return None
 
-        # Quran.com segments are commonly [word_index, start_ms, end_ms].
-        # Treat correction word indexes as 0-based and accept 1-based segment indexes.
-        wanted_start = int(start_word_index) + 1
-        wanted_end = int(end_word_index) + 1
+        # Quran.com segments come as either:
+        #   [word_index, start_ms, end_ms]                     (3 elements)
+        #   [word_index, word_position, start_ms, end_ms]       (4 elements)
+        # In both cases the word index is the FIRST element and the
+        # start/end times are always the LAST two elements — grabbing
+        # segment[:3] unconditionally silently corrupts timing on the
+        # 4-element form (e.g. [0, 1, 30, 740] would misread as
+        # word_index=0, start_ms=1, end_ms=30 instead of 30..740).
+        # Correction word indexes are 0-based; segment word_index may be
+        # 0-based or 1-based depending on payload, so accept either by
+        # comparing against both start and start+1.
+        wanted_start = int(start_word_index)
+        wanted_end = int(end_word_index)
         selected = []
 
         for segment in segments or []:
             if not isinstance(segment, (list, tuple)) or len(segment) < 3:
                 continue
-            word_index, start_ms, end_ms = segment[:3]
             try:
-                word_index = int(word_index)
-                start_ms = int(start_ms)
-                end_ms = int(end_ms)
+                word_index = int(segment[0])
+                start_ms = int(segment[-2])
+                end_ms = int(segment[-1])
             except Exception:
                 continue
-            if wanted_start <= word_index <= wanted_end:
+            # Accept both 0-based and 1-based word_index conventions.
+            if (wanted_start <= word_index <= wanted_end) or (
+                wanted_start + 1 <= word_index <= wanted_end + 1
+            ):
                 selected.append((start_ms, end_ms))
 
         if not selected:

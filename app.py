@@ -591,8 +591,6 @@ def start_live_session(
             start_ayah_val,
             start_ayah_val,
             "",
-            "",
-            stop_on_error=qari_mode,
         )
     
     correction_html = _format_correction_status("LISTENING") if qari_mode else ""
@@ -672,16 +670,16 @@ def _build_expected_ayah_html(session, formatter, qari_mode: bool) -> str:
     if formatter is None or session is None:
         return gr.update()
 
-    if not session.chunk_results:
-        return formatter.format_expected_ayah_html("", "", stop_on_error=qari_mode)
+    recited_text = ""
+    if session.chunk_results:
+        last = session.chunk_results[-1]
+        if last.matched_ayah == session.current_ayah:
+            recited_text = last.corrected_text or ""
 
-    last = session.chunk_results[-1]
-    recited_text = last.raw_asr or last.corrected_text or ""
-    ref_text = formatter.get_raw_ayah_text(session.surah, last.matched_ayah) or (last.matched_ayah_text or "")
     return formatter.format_expected_ayah_html(
+        session.surah,
+        session.current_ayah,
         recited_text,
-        ref_text,
-        stop_on_error=qari_mode,
     )
 
 
@@ -702,20 +700,16 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
         return gr.update()
 
     recited_text = ""
-    matched_ayah_text = ""
     if session.chunk_results:
         last = session.chunk_results[-1]
         if last.matched_ayah == session.current_ayah:
-            recited_text = last.corrected_text or last.raw_asr
-            matched_ayah_text = last.matched_ayah_text or ""
+            recited_text = last.corrected_text or ""
 
     return formatter.format_surah_progress_html(
         session.surah,
         session.start_ayah,
         session.current_ayah,
         recited_text,
-        matched_ayah_text,
-        stop_on_error=qari_mode,
     )
 
 

@@ -28,8 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 COLORS = {
     "correct": "#10b981",   # green
     "minor": "#f59e0b",     # amber / orange
-    "major": "#ef4444",     # red
+    "major": "#ef4444",     # red — also used as "wrong" in the simplified display
     "uncertain": "#9ca3af", # gray
+    "pending": "#94a3b8",   # gray — not yet reached / capped by an earlier mistake
 }
 
 _TAWWUZ_TEXT = "أعوذ بالله من الشيطان الرجيم"
@@ -126,8 +127,12 @@ class LiveDisplayFormatter:
             "major": 0,
             "uncertain": 0,
         }
-        self._expected_correct_locks: Dict[Tuple[str, int], bool] = {}
-        self._surah_correct_locks: Dict[Tuple[int, int], bool] = {}
+        # Persistent per-word status for the ayah currently being recited,
+        # keyed by (surah, ayah). "correct" is sticky (never reverts once
+        # set); "wrong" can later flip to "correct" when the reciter fixes
+        # it. Shared by both the expected-ayah panel and the surah-progress
+        # panel so they always agree on what's actually been gotten right.
+        self._word_status: Dict[Tuple[int, int], List[str]] = {}
 
     # ---- reference loading ----
 
@@ -186,14 +191,84 @@ class LiveDisplayFormatter:
         self._surah_cache[surah] = cache_entry
         return cache_entry
 
+    # ---- shared word-status engine (green/red, sticky, qari-aligned) ----
+
+    def _get_word_status(self, surah: int, ayah: int, ref_words: List[str]) -> List[str]:
+        """Return the persistent per-word status list for (surah, ayah),
+        creating a fresh all-"pending" list the first time it's needed."""
+        key = (int(surah), int(ayah))
+        existing = self._word_status.get(key)
+        if existing is None or len(existing) != len(ref_words):
+            existing = ["pending"] * len(ref_words)
+            self._word_status[key] = existing
+        return existing
+
+    def _update_word_status(
+        self,
+        surah: int,
+        ayah: int,
+        ref_words: List[str],
+        recited_words: List[str],
+    ) -> List[str]:
+        """Diff this chunk's recited words against the full ayah reference
+        and merge the result into the persistent status for (surah, ayah).
+
+        - A word that matches becomes "correct". This is also how a
+          previously "wrong" word gets fixed — it's the same check either way.
+        - A word that mismatches becomes "wrong", but never overwrites an
+          already-"correct" word: green is sticky.
+        - Words this chunk doesn't touch keep whatever status they already had.
+        """
+        status = self._get_word_status(surah, ayah, ref_words)
+        if not recited_words:
+            return status
+
+        ref_norm = [_normalize(w) for w in ref_words]
+        rec_norm = [_normalize(w) for w in recited_words]
+
+        sm = difflib.SequenceMatcher(None, rec_norm, ref_norm)
+        for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for j in range(j1, j2):
+                    status[j] = "correct"
+            elif tag == "replace":
+                for j in range(j1, j2):
+                    if status[j] != "correct":
+                        status[j] = "wrong"
+            # "insert" (ref words this chunk never reached) and "delete"
+            # (extra recited words with no ref counterpart) leave status as-is.
+        return status
+
+    @staticmethod
+    def _render_qari_aligned(ref_words: List[str], status: List[str]) -> List[str]:
+        """Render word spans with qari-style sequential gating: once a word
+        is wrong, no later word may show green until that specific word is
+        fixed (its status flips back to "correct"). Later words show red
+        (if actually wrong) or gray (if correct but not yet credited)."""
+        frontier = next((i for i, s in enumerate(status) if s == "wrong"), None)
+        spans: List[str] = []
+        for idx, word in enumerate(ref_words):
+            s = status[idx] if idx < len(status) else "pending"
+            if frontier is not None and idx >= frontier and s == "correct":
+                color = COLORS["pending"]
+            elif s == "correct":
+                color = COLORS["correct"]
+            elif s == "wrong":
+                color = COLORS["major"]
+            else:
+                color = COLORS["pending"]
+            spans.append(
+                f'<span style="color:{color}; font-weight:600; margin:0 2px; padding:2px 4px; '
+                f'border-radius:4px; background:rgba({LiveDisplayFormatter._hex_to_rgb(color)},0.12);">{word}</span>'
+            )
+        return spans
+
     def format_surah_progress_html(
         self,
         surah: Optional[int],
         start_ayah: int,
         current_ayah: int,
         recited_text: str,
-        matched_ayah_text: str,
-        stop_on_error: bool = True,
     ) -> str:
         if surah is None:
             return self._placeholder_html("Select a surah to view progress.")
@@ -203,81 +278,27 @@ class LiveDisplayFormatter:
             return self._placeholder_html("Surah text not available.")
 
         raw_words: List[str] = cache_entry["raw_words"]  # type: ignore[assignment]
-        norm_words: List[str] = cache_entry["norm_words"]  # type: ignore[assignment]
         ayah_ranges: Dict[int, Tuple[int, int]] = cache_entry["ayah_ranges"]  # type: ignore[assignment]
 
-        statuses = ["pending"] * len(raw_words)
+        all_status = ["pending"] * len(raw_words)
 
         for ayah_num, (start_idx, end_idx) in ayah_ranges.items():
             if ayah_num < start_ayah:
                 continue
             if ayah_num < current_ayah:
                 for idx in range(start_idx, end_idx + 1):
-                    statuses[idx] = "correct"
+                    all_status[idx] = "correct"
                 continue
             if ayah_num > current_ayah:
                 continue
 
-            ref_words = _safe_text(matched_ayah_text).split() if matched_ayah_text else []
-            ref_norm = [_normalize(w) for w in ref_words]
-            hyp_words = _safe_text(recited_text).split() if recited_text else []
-            hyp_norm = [_normalize(w) for w in hyp_words]
-
-            if not ref_norm:
-                break
-
-            ref_statuses = ["pending"] * len(ref_norm)
-            sm = difflib.SequenceMatcher(None, hyp_norm, ref_norm)
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag == "equal":
-                    for j in range(j1, j2):
-                        ref_statuses[j] = "correct"
-                elif tag in ("replace", "delete"):
-                    for j in range(j1, j2):
-                        ref_statuses[j] = "error"
-                    if tag == "insert" and j1 < len(ref_statuses):
-                        ref_statuses[j1] = "error"
-                elif tag == "insert":
-                    if j1 < len(ref_statuses):
-                        ref_statuses[j1] = "error"
-
-            first_error = next((i for i, s in enumerate(ref_statuses) if s == "error"), None)
-            if stop_on_error and first_error is not None:
-                for i in range(first_error + 1, len(ref_statuses)):
-                    if ref_statuses[i] != "correct":
-                        ref_statuses[i] = "pending"
-
+            ref_words = raw_words[start_idx:end_idx + 1]
+            rec_words = _safe_text(recited_text).split() if recited_text else []
+            status = self._update_word_status(surah, ayah_num, ref_words, rec_words)
             for offset, idx in enumerate(range(start_idx, end_idx + 1)):
-                if offset >= len(ref_statuses):
-                    break
-                statuses[idx] = ref_statuses[offset]
-            break
+                all_status[idx] = status[offset]
 
-        for idx, status in enumerate(statuses):
-            lock_key = (int(surah), idx)
-            if status == "correct":
-                self._surah_correct_locks[lock_key] = True
-            elif status == "error":
-                self._surah_correct_locks[lock_key] = False
-            elif self._surah_correct_locks.get(lock_key):
-                statuses[idx] = "correct"
-
-        spans: List[str] = []
-        include_basmala = norm_words[: len(_BASMALA_TOKENS)] != _BASMALA_TOKENS
-        spans.extend(self._build_invocation_spans(include_basmala))
-        for idx, word in enumerate(raw_words):
-            status = statuses[idx]
-            if status == "correct":
-                color = COLORS["correct"]
-            elif status == "error":
-                color = COLORS["major"]
-            else:
-                color = "#94a3b8"
-            spans.append(
-                f'<span style="color:{color}; font-weight:600; margin:0 2px; padding:2px 4px; '
-                f'border-radius:4px; background:rgba({self._hex_to_rgb(color)},0.12);">{word}</span>'
-            )
-
+        spans = self._render_qari_aligned(raw_words, all_status)
         body = " ".join(spans)
         return (
             f'<div dir="rtl" style="'
@@ -425,73 +446,28 @@ class LiveDisplayFormatter:
 
     def format_expected_ayah_html(
         self,
+        surah: Optional[int],
+        ayah: Optional[int],
         recited_text: str,
-        reference_text: str,
-        stop_on_error: bool = True,
     ) -> str:
-        """Render the expected ayah and highlight based on recited words."""
-        ref_words = _safe_text(reference_text).split()
+        """Render the current ayah, word by word, green/red against the ASR
+        text. Always compares against the ACTUAL expected ayah (surah, ayah)
+        — never against whatever ayah the fuzzy matcher guessed — so a bad
+        or low-confidence guess can't make the display show a false match."""
+        if surah is None or ayah is None:
+            return self._placeholder_html("Select a surah to begin.")
+
+        raw_ref_text = self.get_raw_ayah_text(surah, ayah)
+        ref_words = _safe_text(raw_ref_text).split() if raw_ref_text else []
         if not ref_words:
-            body = " ".join(self._build_invocation_spans(include_basmala=True))
-            return (
-                f'<div dir="rtl" style="'
-                f"font-family: 'Amiri', 'Traditional Arabic', 'Arial', serif; "
-                f'font-size: 26px; line-height: 2.2; text-align: right; '
-                f'padding: 20px; border-radius: 12px; '
-                f'background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); '
-                f'border: 1px solid #334155; min-height: 100px;">'
-                f'{body}</div>'
-            )
+            return self._placeholder_html("Ayah text not available.")
 
-        include_basmala = _normalize(reference_text).split()[: len(_BASMALA_TOKENS)] != _BASMALA_TOKENS
+        include_basmala = _normalize(raw_ref_text).split()[: len(_BASMALA_TOKENS)] != _BASMALA_TOKENS
         recited_clean = self._strip_invocations(recited_text, include_basmala=include_basmala)
-
         rec_words = _safe_text(recited_clean).split()
-        ref_norm = [_normalize(w) for w in ref_words]
-        rec_norm = [_normalize(w) for w in rec_words]
 
-        statuses = ["pending"] * len(ref_words)
-
-        if rec_norm:
-            sm = difflib.SequenceMatcher(None, rec_norm, ref_norm)
-            for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
-                if tag == "equal":
-                    for j in range(j1, j2):
-                        statuses[j] = "correct"
-                elif tag in ("replace", "delete"):
-                    for j in range(j1, j2):
-                        statuses[j] = "error"
-                elif tag == "insert":
-                    if j1 < len(statuses):
-                        statuses[j1] = "error"
-
-        first_error = next((i for i, s in enumerate(statuses) if s == "error"), None)
-        if stop_on_error and first_error is not None:
-            for i in range(first_error + 1, len(statuses)):
-                if statuses[i] != "correct":
-                    statuses[i] = "pending"
-
-        reference_key = _normalize(reference_text)
-        for idx, status in enumerate(statuses):
-            lock_key = (reference_key, idx)
-            if status == "correct":
-                self._expected_correct_locks[lock_key] = True
-            elif status == "error":
-                self._expected_correct_locks[lock_key] = False
-            elif self._expected_correct_locks.get(lock_key):
-                statuses[idx] = "correct"
-
-        spans: List[str] = []
-        spans.extend(self._build_invocation_spans(include_basmala))
-        for idx, word in enumerate(ref_words):
-            status = statuses[idx]
-            if status == "correct":
-                color = COLORS["correct"]
-            elif status == "error":
-                color = COLORS["major"]
-            else:
-                color = "#94a3b8"
-            spans.append(self._word_span(word, color))
+        status = self._update_word_status(surah, ayah, ref_words, rec_words)
+        spans = self._render_qari_aligned(ref_words, status)
 
         body = " ".join(spans)
         return (
