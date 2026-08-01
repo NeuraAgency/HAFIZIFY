@@ -158,6 +158,30 @@ def _coverage_prenorm(hyp_n: str, ref_n: str) -> float:
     return overlap / max(1, len(r))
 
 
+def _trim_trailing_unspoken_ref(hyp_words: List[str], ref_words: List[str]) -> List[str]:
+    """Drop reference words the reciter hasn't reached yet.
+
+    A chunk that stops mid-ayah on a natural pause is not a mistake, it just
+    hasn't said the rest yet. Scoring CER/WER/coverage against the FULL
+    reference length penalizes that unspoken tail as if it were missing
+    content, which is what made a perfectly-recited partial ayah look like a
+    low-confidence match. This finds the last reference word actually
+    touched by the hypothesis (via word-level alignment) and drops anything
+    after it before computing quality metrics — the ayah match itself
+    (which reference this is) is unaffected, only how good the match looks.
+    """
+    if not hyp_words or not ref_words:
+        return ref_words
+    matcher = difflib.SequenceMatcher(None, ref_words, hyp_words, autojunk=False)
+    last_touched = -1
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag in ("equal", "replace") and j2 > j1:
+            last_touched = max(last_touched, i2 - 1)
+    if last_touched < 0:
+        return ref_words
+    return ref_words[: last_touched + 1]
+
+
 def _remove_consecutive_duplicates(text: str) -> str:
     tokens = safe_display_text(text).split()
     if not tokens:
@@ -448,6 +472,27 @@ def match_ayah_sequence(
             best = candidate
 
     start, end, ref, cer, wer, cov, confidence, alignment_score = best
+
+    # Rescore against only the portion of the (possibly multi-ayah) reference
+    # the reciter has actually reached — see _trim_trailing_unspoken_ref.
+    # alignment_score is left untouched: it's what decides single-ayah vs
+    # sequence match above and should keep comparing full spans.
+    hyp_words = hyp.split()
+    ref_words = ref.split()
+    trimmed_words = _trim_trailing_unspoken_ref(hyp_words, ref_words)
+    if trimmed_words and len(trimmed_words) < len(ref_words):
+        trimmed_ref = " ".join(trimmed_words)
+        cer = _cer_prenorm(hyp, trimmed_ref)
+        wer = _wer_prenorm(hyp, trimmed_ref)
+        cov = _coverage_prenorm(hyp, trimmed_ref)
+        span_bonus = min(0.08, 0.01 * max(1, end - start + 1))
+        confidence = max(0.0, min(1.0,
+            0.45 * (1.0 - cer)
+            + 0.20 * (1.0 - wer)
+            + 0.30 * cov
+            + span_bonus
+        ))
+
     return {
         "matched_key": (surah, end) if surah is not None else None,
         "matched_ayah": end,
@@ -501,6 +546,23 @@ def match_ayah(
             best = candidate
 
     key, ref, cer, wer, cov, confidence, alignment_score = best
+
+    # Rescore against only the portion of the reference the reciter has
+    # actually reached — see _trim_trailing_unspoken_ref. Without this, a
+    # correctly-recited mid-ayah chunk (e.g. a natural pause partway through
+    # a long ayah) gets penalized for the words it simply hasn't said yet,
+    # which looked identical to real errors/omissions. alignment_score is
+    # left untouched since it isn't used for the ok/minor/error verdict.
+    hyp_words = hyp.split()
+    ref_words = ref.split()
+    trimmed_words = _trim_trailing_unspoken_ref(hyp_words, ref_words)
+    if trimmed_words and len(trimmed_words) < len(ref_words):
+        trimmed_ref = " ".join(trimmed_words)
+        cer = _cer_prenorm(hyp, trimmed_ref)
+        wer = _wer_prenorm(hyp, trimmed_ref)
+        cov = _coverage_prenorm(hyp, trimmed_ref)
+        confidence = max(0.0, min(1.0, 0.65 * (1.0 - cer) + 0.35 * cov))
+
     return {
         "matched_key": key,
         "matched_ayah": key[1],

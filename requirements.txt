@@ -22,3 +22,8 @@ faster-whisper
 groq
 python-dotenv
 scipy
+
+# --- Mobile API (api/) — additive, does not affect the desktop Gradio app ---
+fastapi
+uvicorn[standard]
+python-multipart

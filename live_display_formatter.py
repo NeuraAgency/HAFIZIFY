@@ -226,15 +226,34 @@ class LiveDisplayFormatter:
         ref_norm = [_normalize(w) for w in ref_words]
         rec_norm = [_normalize(w) for w in recited_words]
 
+        # Word-similarity tolerance — matches the fuzzy threshold used
+        # everywhere else in this file (_word_color/_classify_word) and in
+        # correction_engine._words_close. Without this, a word that the
+        # chunk-level guard scored as "ok" (CER/coverage tolerant) but that
+        # differs from the reference by a single character (e.g. a hamza
+        # form or a harmless ASR near-miss) got marked "wrong" here via
+        # strict byte-exact SequenceMatcher comparison, and "wrong" is
+        # sticky — so a correctly recited word could stay red forever.
+        _WORD_MATCH_THRESHOLD = 0.72
+
         sm = difflib.SequenceMatcher(None, rec_norm, ref_norm)
         for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 for j in range(j1, j2):
                     status[j] = "correct"
             elif tag == "replace":
-                for j in range(j1, j2):
-                    if status[j] != "correct":
-                        status[j] = "wrong"
+                rec_slice = rec_norm[_i1:_i2]
+                ref_slice = ref_norm[j1:j2]
+                shared = min(len(rec_slice), len(ref_slice))
+                for offset in range(shared):
+                    j = j1 + offset
+                    if status[j] == "correct":
+                        continue
+                    sim = _char_similarity(rec_slice[offset], ref_slice[offset])
+                    status[j] = "correct" if sim >= _WORD_MATCH_THRESHOLD else "wrong"
+                # Any remaining ref words in this span with no recited
+                # counterpart (ref longer than rec) haven't been reached —
+                # leave them as-is rather than falsely marking "wrong".
             # "insert" (ref words this chunk never reached) and "delete"
             # (extra recited words with no ref counterpart) leave status as-is.
         return status
