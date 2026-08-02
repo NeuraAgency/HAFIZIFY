@@ -64,7 +64,7 @@ from session_manager import (  # noqa: E402
     load_silero_vad,
     get_speech_timestamps,
 )
-from fyp_model.quran_guard import guard_inference  # noqa: E402
+from fyp_model.quran_guard import guard_inference, get_word_error_annotations, correct_text_rules  # noqa: E402
 
 from api.formatters import (  # noqa: E402
     chunk_result_to_json,
@@ -228,6 +228,21 @@ async def transcribe(
                     sequence_max_ayahs=8,
                 )
 
+        word_errors = []
+        ref_text_for_words = guard_result.get("matched_ayah_text") or ""
+        if ref_text_for_words:
+            # Same word-level classifier (correct/minor/major/missing/extra)
+            # your Qari Mode's strict correction logic already uses
+            # internally (realtime_streamer.py's _apply_qari_word_scoring) —
+            # reused here as-is, not reimplemented, so the client gets the
+            # exact same per-word verdicts without duplicating that logic.
+            hyp_for_annotation = correct_text_rules(raw_text, mode="balanced")
+            word_errors = get_word_error_annotations(
+                hyp_for_annotation,
+                ref_text_for_words,
+                confidence=guard_result.get("confidence"),
+            )
+
         return {
             "raw_asr": raw_text,
             "corrected_text": guard_result.get("corrected_text", ""),
@@ -245,6 +260,10 @@ async def transcribe(
             "wer": guard_result.get("wer"),
             "harakaat_errors": harakaat_errors or [],
             "harakaat_error_count": harakaat_error_count,
+            # Per-word verdicts against the matched ayah — status is one of
+            # correct/minor/major/missing/extra/uncertain. Lets the client
+            # drive TTS/correction UI directly without its own matching logic.
+            "word_errors": word_errors,
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
