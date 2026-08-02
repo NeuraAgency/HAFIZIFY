@@ -128,6 +128,15 @@ def transcribe_local(chunk_numpy: np.ndarray, sample_rate: int = 16000) -> str:
         return ""
 
 
+def preload_local_pipeline() -> None:
+    """Public wrapper around _load_local_pipeline() so callers outside this
+    module (app.py's start_live_session()) can force the local turbo
+    model to load synchronously at session-start time, instead of it
+    lazy-loading on the first streamed audio chunk. A no-op if already
+    loaded (e.g. a later session in the same app run)."""
+    _load_local_pipeline()
+
+
 # ---------------------------------------------------------------------------
 # Merge logic (cleaned up from the Colab draft)
 # ---------------------------------------------------------------------------
@@ -138,6 +147,33 @@ def smart_normalize_word(word: str) -> str:
     cleaned = DIACRITICS_PATTERN.sub("", OTHMANI_GLYPHS_RE.sub("", word))
     cleaned = cleaned.replace("إ", "ا").replace("أ", "ا").replace("ٱ", "ا").replace("ٰ", "")
     return cleaned
+
+
+# Max normalized-skeleton edit distance allowed before two same-length,
+# non-identical words in a "replace" block are still treated as a probable
+# same-word pairing for vowel-borrowing purposes (see run_hybrid_combination_logic).
+# Kept small and length-scaled on purpose: short words (<3 letters) are too
+# ambiguous to fuzzy-match at all (e.g. من vs لن is a real, different word,
+# not ASR noise), so those require an exact match.
+_FUZZY_MATCH_MAX_LEN_FOR_TIGHT_THRESHOLD = 6
+
+
+def _is_close_enough(groq_skeleton: str, local_skeleton: str) -> bool:
+    """Same-length-only, small-edit-distance check used to decide whether a
+    Groq/local word pair that difflib did NOT consider an exact match is
+    still close enough to be "the same word, mis-heard by one letter" — as
+    opposed to two genuinely different words that happen to share a slot.
+    Deliberately conservative: exact length match required (character-
+    position vowel injection needs that anyway), and very short words
+    aren't fuzzy-matched at all since a 1-letter edit on a 2-3 letter word
+    is usually a different word, not noise."""
+    if len(groq_skeleton) != len(local_skeleton):
+        return False
+    if len(groq_skeleton) < 3:
+        return groq_skeleton == local_skeleton
+    distance = _compute_levenshtein(groq_skeleton, local_skeleton)
+    threshold = 1 if len(groq_skeleton) <= _FUZZY_MATCH_MAX_LEN_FOR_TIGHT_THRESHOLD else 2
+    return distance <= threshold
 
 
 def inject_vowels_by_character_position(groq_word: str, local_voweled_word: str) -> str:
@@ -193,13 +229,41 @@ def run_hybrid_combination_logic(groq_raw_text: str, local_raw_text: str) -> str
         if tag == "equal":
             for g_idx, l_idx in zip(range(g_start, g_end), range(l_start, l_end)):
                 local_word_mapping[g_idx] = local_words[l_idx]
+        elif tag == "replace" and (g_end - g_start) == (l_end - l_start):
+            # Not an exact skeleton match, but a same-count substitution
+            # block — i.e. difflib thinks these are probably the "same slot"
+            # words, just spelled differently after ASR. The local model
+            # tends to hallucinate consonants (wrong letter choice) while
+            # still tracking vowel timing/placement reasonably well, since
+            # that's driven more by acoustics than by language-model word
+            # choice. So: if a pair in this block is the same normalized
+            # length and differs by only a small edit distance (a
+            # near-miss, not a different word), still trust its vowel
+            # pattern. inject_vowels_by_character_position() only ever pulls
+            # the *diacritic* pattern from this local word — Groq's actual
+            # letters remain the backbone — so a wrong local letter never
+            # leaks into the output either way; the only thing at stake in
+            # this decision is whether we use the vowels or leave the word
+            # bare.
+            for offset, (g_idx, l_idx) in enumerate(zip(range(g_start, g_end), range(l_start, l_end))):
+                g_word, l_word = groq_stripped[g_idx], local_stripped[l_idx]
+                if _is_close_enough(g_word, l_word):
+                    local_word_mapping[g_idx] = local_words[l_idx]
 
     final_words = []
     for idx, groq_word in enumerate(groq_words):
+        # Only inject harakaat when difflib gave us a confident, aligned
+        # match for this exact groq word (an "equal" opcode block). There is
+        # deliberately no positional/index-guess fallback here anymore: if
+        # the sequences drifted (extra/missing/different words between Groq
+        # and local for this stretch), we do NOT pair groq_word with
+        # whatever local word happens to share its raw index — that produced
+        # garbage (e.g. an unrelated local word replacing a groq word
+        # wholesale, or two unrelated words' diacritics/consonants getting
+        # spliced together). Per Hamza: on a mismatch, keep Groq's word bare
+        # rather than guess.
         if idx in local_word_mapping:
             patched = inject_vowels_by_character_position(groq_word, local_word_mapping[idx])
-        elif idx < len(local_words):
-            patched = inject_vowels_by_character_position(groq_word, local_words[idx])
         else:
             patched = groq_word
 

@@ -565,6 +565,7 @@ def start_live_session(
     use_vad,
     auto_surah_detect,
     qari_mode=False,
+    asr_engine="Standard (offline, fast)",
 ):
     """Initialize a new recording session when user clicks Start."""
     global _active_session, _worker_thread, _display_formatter
@@ -576,6 +577,19 @@ def start_live_session(
 
     # Set the model choice on the streamer (triggers reload if different)
     rt_streamer.set_model_choice(model_choice)
+
+    # Combined Mode: force the local turbo model to load NOW, synchronously,
+    # instead of on the first streamed audio chunk. Without this the first
+    # chunk after Start eats the multi-second HF model load on top of
+    # inference, which reads as a large delay right as the reciter starts
+    # speaking. Groq needs no local load (cloud API), so only the local
+    # turbo pipeline is preloaded here.
+    if _parse_asr_engine(asr_engine) == "combined":
+        from hybrid_diacritic_pipeline import preload_local_pipeline
+        try:
+            preload_local_pipeline()
+        except Exception as e:
+            print(f"[Hafizify] Combined Mode local model preload failed, will lazy-load on first chunk: {e}")
 
     if _worker_thread is None or not _worker_thread.is_alive():
         _stop_event.clear()
@@ -699,15 +713,18 @@ def _build_expected_ayah_html(session, formatter, qari_mode: bool) -> str:
         return gr.update()
 
     recited_text = ""
+    harakaat_errors = None
     if session.chunk_results:
         last = session.chunk_results[-1]
         if last.matched_ayah == session.current_ayah:
             recited_text = last.corrected_text or ""
+            harakaat_errors = last.harakaat_errors
 
     return formatter.format_expected_ayah_html(
         session.surah,
         session.current_ayah,
         recited_text,
+        harakaat_errors=harakaat_errors,
     )
 
 
@@ -728,16 +745,19 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
         return gr.update()
 
     recited_text = ""
+    harakaat_errors = None
     if session.chunk_results:
         last = session.chunk_results[-1]
         if last.matched_ayah == session.current_ayah:
             recited_text = last.corrected_text or ""
+            harakaat_errors = last.harakaat_errors
 
     return formatter.format_surah_progress_html(
         session.surah,
         session.start_ayah,
         session.current_ayah,
         recited_text,
+        harakaat_errors=harakaat_errors,
     )
 
 
@@ -1044,7 +1064,7 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
         merged_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed, badge_html = \
             _build_live_ui_snapshot(session)
         yield (
-            "🔴 Finalizing session and computing full comparison...",
+            "🔴 Finalizing session...",
             merged_html, progress_html, error_html, all_raw, all_corrected,
             chunks_table, "", {}, guessed, badge_html, None, ""
         )
@@ -1052,20 +1072,13 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
         # ---- 4. Finalize (saves WAVs + JSON) ----
         results_path = session.finalize()
 
-        # ---- 5. Full session re-decode for comparison ----
-        full_decode = rt_streamer.decode_full_session(session, correction_mode=correction_mode)
-
+        # ---- 5. Build session summary from chunk-by-chunk results only ----
+        # (Removed the full-session re-decode/"compare" step — re-decoding the
+        # entire session's audio from scratch on CPU as one blob was taking
+        # ~1 minute and crashing after Stop was pressed. The chunk-by-chunk
+        # merged transcript already covers everything needed; this just
+        # drops the redundant second decode pass.)
         chunk_merged = session.get_merged_transcript()
-        full_session_raw = full_decode.get("raw_asr", "")
-        guard_result = full_decode.get("guard_result", {})
-        full_session_corrected = guard_result.get("corrected_text", full_session_raw)
-
-        viterbi_result = full_decode.get("viterbi_result", {})
-        viterbi_path = ""
-        viterbi_text = ""
-        if viterbi_result and viterbi_result.get("aligned_ayahs"):
-            viterbi_text = " ".join([a["text"] for a in viterbi_result["aligned_ayahs"]])
-            viterbi_path = " → ".join([a["surah_ayah_id"] for a in viterbi_result["aligned_ayahs"]])
 
         detected_surah = session.get_detected_surah()
         lock_state = getattr(session, "surah_lock_state", None)
@@ -1076,25 +1089,10 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
             guessed_surah_name = _format_surah_guess(lock_state, detected_surah)
             badge_html = _format_surah_badge(lock_state)
 
-        comparison = f"""## 📊 Session Comparison
+        comparison = f"""## 📊 Session Summary
 
 ### Chunk-by-Chunk Merged Transcript
 > {chunk_merged or '(no chunks processed)'}
-
----
-
-### Full Session Single-Decode (Raw)
-> {full_session_raw or '(empty)'}
-
-### Full Session Corrected (Guard Pipeline)
-> {full_session_corrected or '(empty)'}
-
----
-
-### Viterbi Alignment
-**Path:** {viterbi_path or '(not available)'}
-
-> {viterbi_text or '(not available)'}
 
 ---
 
@@ -1105,7 +1103,7 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
 - **Session ID:** {session.session_id}
 """
 
-        eval_report = full_decode.get("eval_result", {})
+        eval_report = {}
 
         status = (
             f"🔴 Session ended — {len(session.chunk_results)} chunks, "
@@ -1138,6 +1136,27 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
         )
 
 
+def _preload_live_model():
+    """Warm up the Live Recitation model (rt_streamer) at app startup.
+
+    Without this, the model load happens lazily inside start_live_session(),
+    which now fires directly off mic_input.start_recording() since the
+    separate Start Session button was removed. That made model loading a
+    multi-second BLOCKING call that runs at the exact moment the browser
+    starts uploading its first streaming audio chunk — on Windows/Chrome
+    this races and can leave a truncated temp .wav on disk, which ffmpeg
+    then fails to decode (CouldntDecodeError / 'Invalid data found when
+    processing input'). Preloading here means create_session()'s internal
+    _ensure_model_loaded() call is a no-op by the time Record is tapped.
+    """
+    try:
+        rt_streamer.set_model_choice("whisper-base-quran-lora")
+        rt_streamer._ensure_model_loaded()
+        print("[Hafizify] Live Recitation model preloaded at startup.")
+    except Exception as e:
+        print(f"[Hafizify] Live model preload failed, will lazy-load on first Record tap: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -1148,13 +1167,83 @@ _APP_CSS = """
     display: none !important;
 }
 
+/* ===================== Dark navy / teal reskin =====================
+   These override Gradio's own CSS custom properties, so they apply
+   regardless of exact Gradio version without touching any Python
+   theme API surface. Component wiring below this block is untouched. */
+:root, .dark {
+    --body-background-fill: #0a0f17 !important;
+    --background-fill-primary: #131b28 !important;
+    --background-fill-secondary: #0f1622 !important;
+    --block-background-fill: #131b28 !important;
+    --panel-background-fill: #131b28 !important;
+    --border-color-primary: rgba(255,255,255,0.08) !important;
+    --block-border-color: rgba(255,255,255,0.08) !important;
+    --block-label-background-fill: transparent !important;
+    --block-label-text-color: #7f93aa !important;
+    --block-title-text-color: #e7edf5 !important;
+    --body-text-color: #e7edf5 !important;
+    --body-text-color-subdued: #8fa3b8 !important;
+    --input-background-fill: #0f1622 !important;
+    --input-border-color: rgba(79,179,196,0.28) !important;
+    --input-border-color-focus: #4fb3c4 !important;
+    --button-primary-background-fill: linear-gradient(135deg, #5ec4d6 0%, #3f97a8 100%) !important;
+    --button-primary-background-fill-hover: linear-gradient(135deg, #6ed0e1 0%, #4aa6b8 100%) !important;
+    --button-primary-text-color: #06141c !important;
+    --button-primary-border-color: transparent !important;
+    --button-secondary-background-fill: #16202f !important;
+    --button-secondary-text-color: #cfe0ee !important;
+    --button-secondary-border-color: rgba(255,255,255,0.08) !important;
+    --button-cancel-background-fill: linear-gradient(135deg, #e07a86 0%, #b8505f 100%) !important;
+    --button-cancel-text-color: #06141c !important;
+    --button-cancel-border-color: transparent !important;
+    --slider-color: #4fb3c4 !important;
+}
+
+body, .gradio-container {
+    background:
+        radial-gradient(circle at 20% 0%, rgba(79, 179, 196, 0.10), transparent 40%),
+        linear-gradient(180deg, #0c121c 0%, #0a0f17 100%) !important;
+}
+
+.gradio-container .block, .gradio-container .form {
+    border-radius: 16px !important;
+}
+
+/* Sidebar / main-panel columns on the Live Recitation tab */
+.sidebar-col > .form, .sidebar-col {
+    background: transparent !important;
+}
+.sidebar-col .block {
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28) !important;
+}
+.main-col .block {
+    box-shadow: 0 10px 26px rgba(0, 0, 0, 0.22) !important;
+}
+
+/* Buttons */
+button.primary, .btn-start button {
+    box-shadow: 0 12px 26px rgba(79, 179, 196, 0.22) !important;
+    font-weight: 700 !important;
+    border-radius: 12px !important;
+}
+button.stop, .btn-stop button {
+    box-shadow: 0 12px 26px rgba(216, 90, 105, 0.22) !important;
+    font-weight: 700 !important;
+    border-radius: 12px !important;
+}
+
 .live-status { 
     font-size: 1.05em; 
     padding: 14px; 
-    border-radius: 8px; 
-    background: rgba(80, 175, 199, 0.08); 
-    color: #e2e8f0; 
-    border: 1px solid rgba(80, 175, 199, 0.25);
+    border-radius: 12px; 
+    background: rgba(79, 179, 196, 0.08) !important; 
+    color: #e7edf5 !important; 
+    border: 1px solid rgba(79, 179, 196, 0.28) !important;
+}
+.live-status textarea {
+    background: transparent !important;
+    color: #e7edf5 !important;
 }
 
 .transcript-box textarea { 
@@ -1167,21 +1256,97 @@ _APP_CSS = """
 
 .chunk-table { 
     font-size: 0.88em; 
+    color: #cfe0ee;
+}
+.chunk-table th {
+    color: #7f93aa;
 }
 
 .comparison-panel {
-    border: 1px solid rgba(80, 175, 199, 0.2);
-    border-radius: 8px;
+    border: 1px solid rgba(79, 179, 196, 0.22);
+    border-radius: 16px;
     padding: 16px;
-    background: #1a1a2e;
+    background: #131b28;
+}
+
+/* Settings gear button */
+.sidebar-top-row {
+    justify-content: flex-end !important;
+    align-items: center !important;
+    gap: 0 !important;
+}
+.settings-gear-btn, .settings-gear-btn button {
+    width: 42px !important;
+    min-width: 42px !important;
+    height: 42px !important;
+    padding: 0 !important;
+    border-radius: 12px !important;
+    font-size: 1.15rem !important;
+    flex: none !important;
+}
+
+/* Settings popup (Qari Mode + Tajweed Detection) — visibility is fully
+   controlled by the .modal-hidden class we toggle ourselves, not by
+   Gradio's own visible= prop, so there's no conflict with however a given
+   Gradio version implements component hiding internally. */
+.settings-modal-overlay {
+    position: fixed !important;
+    inset: 0 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    background: rgba(5, 8, 13, 0.72) !important;
+    backdrop-filter: blur(3px);
+    display: flex;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 20px !important;
+    z-index: 9999 !important;
+}
+.settings-modal-overlay.modal-hidden {
+    display: none !important;
+    pointer-events: none !important;
+}
+.settings-modal-card {
+    max-width: 420px !important;
+    width: 100% !important;
+    background: #131b28 !important;
+    border: 1px solid rgba(79, 179, 196, 0.28) !important;
+    border-radius: 20px !important;
+    padding: 22px !important;
+    box-shadow: 0 30px 70px rgba(0, 0, 0, 0.55) !important;
+}
+.settings-close-btn, .settings-close-btn button {
+    width: 100% !important;
+    margin-top: 6px !important;
+    background: #16202f !important;
+    color: #cfe0ee !important;
+    border: 1px solid rgba(79, 179, 196, 0.35) !important;
+    border-radius: 999px !important;
+    font-weight: 700 !important;
+    box-shadow: none !important;
+}
+.settings-close-btn button:hover {
+    background: #1c2a3d !important;
+    border-color: #4fb3c4 !important;
+}
+
+/* Hide the mic component's native toolbar overflow ("⋯") menu —
+   best-effort: Gradio's exact internal class name for this varies by
+   version, so several common patterns are covered; any that don't match
+   simply do nothing. */
+.mic-visualizer .overflow-menu,
+.mic-visualizer .dropdown-arrow,
+.mic-visualizer [aria-label="More options"],
+.mic-visualizer [aria-label="Show menu"],
+.mic-visualizer button[title="More options"],
+.mic-visualizer .icon-button-wrapper:has(> button[aria-haspopup]) {
+    display: none !important;
 }
 """
 
 with gr.Blocks(title="Hafizify — Quran ASR") as app:
     gr.Markdown(
-        "# 📖 Hafizify — Quran ASR with Real-Time Recitation\n"
-        "Upload audio or **recite live** through your microphone with real-time "
-        "overlapping chunk processing and dual recording."
+        "# 📖 Hafizify — Quran ASR with Real-Time Recitation"
     )
 
     with gr.Tabs():
@@ -1198,12 +1363,15 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
 
             with gr.Row():
                 # ---- Left: Controls ----
-                with gr.Column(scale=1):
+                with gr.Column(scale=1, elem_classes=["sidebar-col"]):
+                    with gr.Row(elem_classes=["sidebar-top-row"]):
+                        settings_btn = gr.Button("⚙️", elem_classes=["settings-gear-btn"], size="sm")
                     live_status = gr.Textbox(
                         label="Session Status",
                         value="⚪ Ready — Configure settings and click Start",
                         interactive=False,
                         elem_classes=["live-status"],
+                        visible=False,
                     )
 
                     with gr.Accordion("📋 Recitation Settings", open=True):
@@ -1211,6 +1379,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             choices=MODEL_CHOICES,
                             value="whisper-base-quran-lora",
                             label="🤖 ASR Model",
+                            visible=False,
                         )
                         live_asr_engine_selector = gr.Radio(
                             choices=[
@@ -1220,6 +1389,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             value="Standard (offline, fast)",
                             label="⚙️ ASR Engine",
                             info="Combined Mode: requires internet + GPU, more accurate diacritics.",
+                            visible=False,
                         )
                         surah_dropdown = gr.Dropdown(
                             choices=SURAH_NAMES,
@@ -1232,6 +1402,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             minimum=1,
                             maximum=286,
                             precision=0,
+                            visible=False,
                         )
                         live_correction_mode = gr.Dropdown(
                             ["safe", "balanced", "aggressive"],
@@ -1245,13 +1416,23 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             info="Disable automatic surah locking and guessing",
                             visible=False,
                         )
-                        qari_mode_checkbox = gr.Checkbox(
-                            value=False,
-                            label="🎙️ Interactive Qari Mode",
-                            info="Enables interactive TTS feedback to correct recitation mistakes.",
-                        )
 
-                    with gr.Accordion("⚙️ Chunk Settings", open=False):
+                    with gr.Column(elem_classes=["settings-modal-overlay", "modal-hidden"]) as settings_modal:
+                        with gr.Group(elem_classes=["settings-modal-card"]):
+                            gr.Markdown("### ⚙️ Advanced Settings")
+                            qari_mode_checkbox = gr.Checkbox(
+                                value=False,
+                                label="🎙️ Interactive Qari Mode",
+                                info="Enables interactive TTS feedback to correct recitation mistakes.",
+                            )
+                            tajweed_toggle = gr.Checkbox(
+                                value=False,
+                                label="🎯 Active Tajweed Detection",
+                                info="On: Combined Groq + Local, harakaat-aware (needs internet). Off: local offline model.",
+                            )
+                            close_settings_btn = gr.Button("Close", elem_classes=["settings-close-btn"], size="sm")
+
+                    with gr.Accordion("⚙️ Chunk Settings", open=False, visible=False):
                         use_vad_checkbox = gr.Checkbox(
                             value=True,
                             label="🧠 Use VAD Chunking (recommended)",
@@ -1272,19 +1453,22 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                             label="Overlap Duration (fallback if VAD off)",
                         )
 
-                    with gr.Row():
-                        start_btn = gr.Button("▶️ Start Session", variant="primary", size="lg")
-                        stop_btn = gr.Button("⏹️ Stop & Compare", variant="stop", size="lg")
+                    start_session_btn = gr.Button(
+                        "▶️ Start Session",
+                        elem_classes=["btn-start"],
+                        variant="primary",
+                    )
 
                     mic_input = gr.Audio(
                         sources=["microphone"],
                         streaming=True,
-                        label="🎤 Microphone",
+                        label="🎤 Tap Record to Start/Stop Reciting",
                         type="numpy",
+                        elem_classes=["mic-visualizer"],
                     )
 
                 # ---- Right: Live Output ----
-                with gr.Column(scale=2):
+                with gr.Column(scale=2, elem_classes=["main-col"]):
                     guessed_surah_box = gr.Textbox(
                         label="🔍 Guessed Surah (auto-detected)",
                         value="Listening...",
@@ -1306,6 +1490,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                     live_merged_display = gr.HTML(
                         label="Expected Ayah (Word-by-Word)",
                         value=LiveDisplayFormatter._placeholder_html("Start reciting..."),
+                        visible=False,
                     )
 
                     surah_progress_display = gr.HTML(
@@ -1319,7 +1504,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                         visible=False,
                     )
 
-                    with gr.Accordion("📝 Raw vs Corrected", open=False):
+                    with gr.Accordion("📝 Raw vs Corrected", open=False, visible=False):
                         with gr.Row():
                             raw_asr_box = gr.Textbox(
                                 label="Raw ASR Output",
@@ -1355,9 +1540,31 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                     )
 
             # ---- Event wiring ----
-            start_btn.click(
+            settings_btn.click(
+                fn=lambda: gr.update(elem_classes=["settings-modal-overlay"]),
+                outputs=[settings_modal],
+            )
+            close_settings_btn.click(
+                fn=lambda: gr.update(elem_classes=["settings-modal-overlay", "modal-hidden"]),
+                outputs=[settings_modal],
+            )
+
+            tajweed_toggle.change(
+                fn=lambda active: (
+                    "Combined (Groq + Local, harakaat-aware, needs internet)"
+                    if active else "Standard (offline, fast)"
+                ),
+                inputs=[tajweed_toggle],
+                outputs=[live_asr_engine_selector],
+            )
+
+            # Start Session button loads the model + creates the session BEFORE
+            # the mic ever opens, so create_session()'s _ensure_model_loaded()
+            # blocking call can never race with the browser's first streaming
+            # audio upload (that race caused ffmpeg CouldntDecodeError on Record tap).
+            start_session_btn.click(
                 fn=start_live_session,
-                inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_checkbox],
+                inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_checkbox, live_asr_engine_selector],
                 outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, comparison_md, surah_badge_html, correction_status_box],
             )
 
@@ -1367,7 +1574,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                 outputs=[live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html, correction_status_box],
             )
 
-            stop_btn.click(
+            mic_input.stop_recording(
                 fn=stop_live_session,
                 inputs=[live_correction_mode, qari_mode_checkbox, live_asr_engine_selector],
                 outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
@@ -1375,89 +1582,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                          session_eval_json, guessed_surah_box, surah_badge_html, session_audio_output, correction_status_box],
             )
 
-        # =====================================================================
-        # TAB 2: File Upload (existing functionality)
-        # =====================================================================
-        with gr.Tab("📁 Upload Audio", id="upload_tab"):
-            gr.Markdown(
-                "### Upload Recitation File\n"
-                "Upload a Quranic recitation (MP3/WAV) to compare **greedy** vs "
-                "**beam search + KenLM** decoding, followed by the guard correction pipeline."
-            )
-
-            with gr.Row():
-                # ---- Left column: inputs & settings ----
-                with gr.Column(scale=1):
-                    audio_input = gr.Audio(type="filepath", label="Upload Recitation (MP3/WAV)")
-
-                    upload_model_selector = gr.Dropdown(
-                        choices=MODEL_CHOICES,
-                        value="whisper-base-quran-lora",
-                        label="🤖 ASR Model",
-                    )
-
-                    with gr.Accordion("⚙️ Decoding Settings", open=True):
-                        use_beam = gr.Checkbox(
-                            value=False,
-                            label="🔍 Use Beam Search + KenLM",
-                        )
-                        beam_width_slider = gr.Slider(
-                            minimum=10,
-                            maximum=500,
-                            value=100,
-                            step=10,
-                            label="Beam Width (higher = better but slower)",
-                        )
-                        gr.Markdown(
-                            "*Beam width 50–100 is a good trade-off. "
-                            "Use 200+ for best quality.*"
-                        )
-
-                    with gr.Accordion("⚙️ Correction Settings", open=False):
-                        correction_mode = gr.Dropdown(
-                            ["safe", "balanced", "aggressive"],
-                            value="balanced",
-                            label="Correction Mode",
-                        )
-                        sequence_guard = gr.Checkbox(
-                            value=False,
-                            label="Enable Sequence Guard (Multi-Ayah Matching)",
-                        )
-                        allow_reference_replacement = gr.Checkbox(
-                            value=False,
-                            label="Allow Aggressive Full Replacement",
-                        )
-
-                    submit_btn = gr.Button("🎙️ Transcribe & Correct", variant="primary")
-
-                # ---- Right column: outputs ----
-                with gr.Column(scale=2):
-                    raw_output = gr.Textbox(label="Raw ASR Output", lines=4)
-                    corrected_output = gr.Textbox(
-                        label="Corrected Output (Guard Pipeline)", lines=4
-                    )
-
-                    with gr.Row():
-                        confidence = gr.Textbox(label="Confidence")
-                        verdict = gr.Textbox(label="Verdict")
-                        method_box = gr.Textbox(label="Decode Method")
-                        upload_surah_guess = gr.Textbox(label="Detected Surah")
-                        
-                    evaluation_output = gr.JSON(label="Error Analysis / Evaluation Report")
-
-            submit_btn.click(
-                fn=transcribe,
-                inputs=[
-                    audio_input,
-                    upload_model_selector,
-                    correction_mode,
-                    sequence_guard,
-                    allow_reference_replacement,
-                    use_beam,
-                    beam_width_slider,
-                ],
-                outputs=[raw_output, corrected_output, confidence, verdict, method_box, upload_surah_guess, evaluation_output],
-            )
+    app.load(fn=_preload_live_model)
 
 if __name__ == "__main__":
     print("Starting Hafizify Gradio app ...")

@@ -301,3 +301,124 @@ while state is `CORRECTING` for both engines, and `VERIFYING` is handled
 explicitly via `consume_pending_match`, so the narrowing is a minor
 real-time-decode precision tweak, not a correctness requirement. Revisit
 if Combined + Qari Mode testing (Phase 7) shows it's needed.
+
+**2026-08-02 (later same day) — Phase 1/2 correctness bug found + fixed
+(Claude, chat), reported by Hamza with a live bad output.**
+
+Hamza noticed Combined mode's output for a Fatiha chunk ("Groq: الحمد لله
+رب العالمين" / "Local: من حبل اللّه ربّ العالمين" → "Combined:
+من للهِ ربّ العالمين") wasn't taking words from Groq + harakaat from local
+as designed — it was dropping/mangling Groq words entirely.
+
+Root cause in `hybrid_diacritic_pipeline.py::run_hybrid_combination_logic()`:
+the per-word loop only had a real alignment (`local_word_mapping`, built
+from difflib's `"equal"` opcodes) for words difflib confidently matched
+between Groq and local. For every other word, it fell back to
+`local_words[idx]` — pairing by *raw index position*, not by actual
+alignment. Any time Groq/local word counts or wording diverged for a
+stretch (routine, since they're two different models), this silently
+paired unrelated words: either overwriting a Groq word wholesale with an
+unrelated local word (skeleton-length mismatch → fallback returns the
+local word verbatim), or splicing one word's consonants with a different
+word's diacritics (skeleton-length coincidentally equal).
+
+Agreed fix direction (Hamza): Groq's words are the backbone and are never
+dropped/overwritten. Harakaat is only pasted on when there's a confident
+local-model match for that specific word; on a mismatch, leave the Groq
+word bare rather than guess. Downstream, a bare (non-diacritized) word
+should only ever be checked for word/makhraj correctness — never flagged
+as a harakaat mistake just because it has no vowels to compare; a word
+that does carry harakaat gets checked for both.
+
+Fixes made:
+1. **`hybrid_diacritic_pipeline.py`** — removed the `elif idx < len(local_words):`
+   index-guess fallback in `run_hybrid_combination_logic()` entirely. A
+   Groq word now only gets `inject_vowels_by_character_position()` applied
+   if `idx in local_word_mapping` (a genuine difflib `"equal"`-block
+   match); otherwise it passes through unchanged. No behavior change to
+   `inject_vowels_by_character_position()` itself or to the already-correct
+   equal-block path.
+2. **`harakaat_error_detector.py`** — added `harakaat_checked: bool = True`
+   to `WordAnnotation`. In `detect_harakaat_errors()`'s `"equal"`-tag
+   branch, a predicted word with no diacritics at all now gets
+   `status="ok", harakaat_checked=False` (word/skeleton already matched to
+   get into this branch — no harakaat claim is made either way) instead of
+   being counted as `harakaat_error` just because it differs textually
+   from a diacritized reference word. Words that do carry diacritics keep
+   the existing ok/harakaat_error comparison, unchanged.
+
+Not done yet: downstream consumers of `WordAnnotation` (display layer /
+`live_display_formatter.py`'s amber-highlight branch, §4.5 — not yet
+built) should read `harakaat_checked` and NOT amber-highlight a word where
+it's `False`, since that's an intentional "unknown", not a flagged error.
+Flag this for whoever builds Phase 6.
+
+**2026-08-02 (later same day, second round) — fuzzy same-slot matching
+added to `hybrid_diacritic_pipeline.py` (Claude, chat), per Hamza.**
+
+The fix above was too strict in one specific, real case: local model gets
+the *consonants* wrong (hallucinated letter) but the *vowel pattern*
+right — e.g. Groq `اهدنا`, local `إِهْتِنَا` (one wrong letter, ت
+for د, but the exact same vowel sequence in the same positions). Since
+difflib's `"equal"` opcode requires the whole normalized word to match,
+this pair landed in a `"replace"` block and, after the first fix, was left
+bare — throwing away a genuinely correct vowel pattern along with the one
+wrong letter.
+
+Added a second, narrower matching tier inside `run_hybrid_combination_logic()`:
+within a `"replace"` opcode block where Groq and local have the *same word
+count* (a plausible 1:1 substitution, not an insertion/deletion drift), a
+pair is now also treated as a confident match — and gets vowel injection
+— if `_is_close_enough()` says so: same normalized length (required
+anyway for character-position injection) and a small edit distance (1 for
+words ≤ 6 letters, 2 for longer; words under 3 letters require an exact
+match, since a 1-letter edit on a very short word is usually just a
+different word, not ASR noise). This is safe by construction —
+`inject_vowels_by_character_position()` always keeps Groq's letters as the
+backbone and only ever borrows the *diacritic* pattern from the local
+word, so a wrong local letter can never leak into the output; fuzzy-
+matching only changes whether we use the vowels or leave the word bare.
+No change to the exact-match (`"equal"`) path, which still takes priority.
+
+**2026-08-02 (later same day, third round) — two false-positive sources
+fixed in `harakaat_error_detector.py` (Claude, chat), per Hamza, from a
+live log showing `harakaat_errors=2` on a chunk that was actually correct.**
+
+Both mismatches in the flagged chunk (`الرَّحْمَنِ الرَّحِيمَ` predicted vs
+`الرَّحْمَٰنِ الرَّحِيمِ` reference) were false positives, not real recitation
+mistakes:
+
+1. **Dagger-alif (ٰ).** The reference carries it (`مَٰ`), but neither
+   Groq nor the local Whisper model can ever produce that character — it's
+   a Quranic-orthography convention, not something ASR output uses. Any
+   ayah containing one would falsely flag forever, regardless of correct
+   recitation.
+2. **Last word of the ayah's case-ending vowel.** `الرَّحِيمَ` (predicted,
+   fatha) vs `الرَّحِيمِ` (reference, kasra) — could be a real slip, but
+   final-word case endings legitimately change under pausal recitation
+   (waqf) and are the least ASR-reliable vowel position generally, so
+   flagging them outright is unreliable.
+
+Hamza's direction: fix #1 outright (never a real signal). For #2, be
+narrow — only skip the FINAL diacritic mark of the LAST word of the ayah,
+nothing more; every other diacritic in that same word, and every other
+word, still gets checked normally.
+
+Fixes made, both scoped to the `"equal"`-tag comparison in
+`detect_harakaat_errors()`:
+- Added `_strip_dagger_alif()` — strips `\u0670` from the reference word
+  before the equality check (predicted text never has it, so this is a
+  one-sided but symmetric-safe strip).
+- Added `_strip_last_diacritic_cluster()` — reuses
+  `decompose_diacritic_clusters()` to rebuild a word with the diacritic
+  cluster on its FINAL base character removed, keeping every other
+  letter's diacritics intact. Applied to both predicted and reference word
+  only when `ref_idx == len(ref_words) - 1` (this word is literally the
+  last word of the ayah's reference text).
+- `WordAnnotation` gained `final_vowel_skipped: bool = False`, set True on
+  annotations for that last word, so downstream consumers (display layer,
+  eval/logging) can see when a word's ending wasn't fully checked rather
+  than silently trusting a pass.
+- No change to non-last words, no change to the `makhraj_error` /
+  `replace`/`insert`/`delete` branches, no change to
+  `hybrid_diacritic_pipeline.py`.

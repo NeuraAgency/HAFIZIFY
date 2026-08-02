@@ -1127,6 +1127,12 @@ class RealtimeStreamer:
         decode_time = time.time() - t0
         detection_text = _strip_leading_invocations(raw_text, strip_basmala=True)
 
+        # Per-engine terminal output — confirms both models are actually
+        # running and lets you compare their raw outputs chunk by chunk.
+        print(f"[Chunk-Combined] Groq:     {decode_result['groq_text']}")
+        print(f"[Chunk-Combined] Local:    {decode_result['local_text']}")
+        print(f"[Chunk-Combined] Combined: {decode_result['combined_text']}")
+
         # 2. Rolling-window surah detection — same mechanism as process_chunk
         if not hasattr(session, "_detection_buffer"):
             session._detection_buffer = []

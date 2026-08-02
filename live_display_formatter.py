@@ -218,14 +218,19 @@ class LiveDisplayFormatter:
         ayah: int,
         ref_words: List[str],
         recited_words: List[str],
+        harakaat_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """Diff this chunk's recited words against the full ayah reference
         and merge the result into the persistent status for (surah, ayah).
 
         - A word that matches becomes "correct". This is also how a
           previously "wrong" word gets fixed — it's the same check either way.
+        - A word whose consonants match but that was flagged by the harakaat
+          (vowel-only) detector becomes "harakaat" instead of "correct" —
+          Combined Mode only; harakaat_errors is always None/empty in
+          Standard Mode so this is a no-op there.
         - A word that mismatches becomes "wrong", but never overwrites an
-          already-"correct" word: green is sticky.
+          already-"correct"/"harakaat" word: green (and gold) are sticky.
         - Words this chunk doesn't touch keep whatever status they already had.
         """
         status = self._get_word_status(surah, ayah, ref_words)
@@ -234,6 +239,19 @@ class LiveDisplayFormatter:
 
         ref_norm = [_normalize(w) for w in ref_words]
         rec_norm = [_normalize(w) for w in recited_words]
+
+        # Normalized (diacritic-stripped) predicted words flagged as a
+        # harakaat-only mistake this chunk. normalize_arabic already strips
+        # diacritics, so a harakaat error (same consonants, wrong vowels)
+        # always lands in the SequenceMatcher "equal" tag below, never
+        # "replace" — matched by text, not the detector's word index, since
+        # this function's recited_words/ref_words can be offset from the
+        # detector's original chunk text (e.g. a stripped leading Basmala).
+        harakaat_norm_words = {
+            _normalize(h.get("predicted") or "")
+            for h in (harakaat_errors or [])
+            if h.get("predicted")
+        }
 
         # Word-similarity tolerance — matches the fuzzy threshold used
         # everywhere else in this file (_word_color/_classify_word) and in
@@ -249,14 +267,14 @@ class LiveDisplayFormatter:
         for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 for j in range(j1, j2):
-                    status[j] = "correct"
+                    status[j] = "harakaat" if ref_norm[j] in harakaat_norm_words else "correct"
             elif tag == "replace":
                 rec_slice = rec_norm[_i1:_i2]
                 ref_slice = ref_norm[j1:j2]
                 shared = min(len(rec_slice), len(ref_slice))
                 for offset in range(shared):
                     j = j1 + offset
-                    if status[j] == "correct":
+                    if status[j] in ("correct", "harakaat"):
                         continue
                     sim = _char_similarity(rec_slice[offset], ref_slice[offset])
                     status[j] = "correct" if sim >= _WORD_MATCH_THRESHOLD else "wrong"
@@ -270,24 +288,28 @@ class LiveDisplayFormatter:
     @staticmethod
     def _render_qari_aligned(ref_words: List[str], status: List[str]) -> List[str]:
         """Render word spans with qari-style sequential gating: once a word
-        is wrong, no later word may show green until that specific word is
-        fixed (its status flips back to "correct"). Later words show red
-        (if actually wrong) or gray (if correct but not yet credited)."""
+        is wrong, no later word may show green/gold until that specific word
+        is fixed (its status flips back to "correct"/"harakaat"). Later words
+        show red (if actually wrong) or gray (if correct but not yet
+        credited)."""
         frontier = next((i for i, s in enumerate(status) if s == "wrong"), None)
         spans: List[str] = []
         for idx, word in enumerate(ref_words):
             s = status[idx] if idx < len(status) else "pending"
-            if frontier is not None and idx >= frontier and s == "correct":
+            if frontier is not None and idx >= frontier and s in ("correct", "harakaat"):
                 color = COLORS["pending"]
             elif s == "correct":
                 color = COLORS["correct"]
+            elif s == "harakaat":
+                color = COLORS["harakaat"]
             elif s == "wrong":
                 color = COLORS["major"]
             else:
                 color = COLORS["pending"]
             spans.append(
-                f'<span style="color:{color}; font-weight:600; margin:0 2px; padding:2px 4px; '
-                f'border-radius:4px; background:rgba({LiveDisplayFormatter._hex_to_rgb(color)},0.12);">{word}</span>'
+                f'<span style="display:inline-flex; align-items:center; color:{color}; font-weight:600; margin:3px; '
+                f'padding:6px 14px; border-radius:999px; background:rgba({LiveDisplayFormatter._hex_to_rgb(color)},0.14); '
+                f'border:1px solid rgba({LiveDisplayFormatter._hex_to_rgb(color)},0.35);">{word}</span>'
             )
         return spans
 
@@ -297,6 +319,7 @@ class LiveDisplayFormatter:
         start_ayah: int,
         current_ayah: int,
         recited_text: str,
+        harakaat_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if surah is None:
             return self._placeholder_html("Select a surah to view progress.")
@@ -322,7 +345,7 @@ class LiveDisplayFormatter:
 
             ref_words = raw_words[start_idx:end_idx + 1]
             rec_words = _safe_text(recited_text).split() if recited_text else []
-            status = self._update_word_status(surah, ayah_num, ref_words, rec_words)
+            status = self._update_word_status(surah, ayah_num, ref_words, rec_words, harakaat_errors=harakaat_errors)
             for offset, idx in enumerate(range(start_idx, end_idx + 1)):
                 all_status[idx] = status[offset]
 
@@ -331,10 +354,11 @@ class LiveDisplayFormatter:
         return (
             f'<div dir="rtl" style="'
             f"font-family: 'Amiri', 'Traditional Arabic', 'Arial', serif; "
-            f'font-size: 22px; line-height: 2.2; text-align: right; '
-            f'padding: 18px; border-radius: 12px; '
-            f'background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); '
-            f'border: 1px solid #334155; min-height: 120px;">'
+            f'font-size: 20px; text-align: right; display: flex; flex-wrap: wrap; '
+            f'justify-content: flex-end; align-content: flex-start; '
+            f'padding: 18px; border-radius: 16px; '
+            f'background: linear-gradient(135deg, #141c2b 0%, #0f1622 100%); '
+            f'border: 1px solid rgba(79,179,196,0.22); min-height: 120px;">'
             f'{body}</div>'
         )
 
@@ -480,11 +504,12 @@ class LiveDisplayFormatter:
         return " ".join(spans)
 
     def _word_span(self, word: str, color: str) -> str:
-        """Build a single colored word span."""
+        """Build a single colored word chip."""
         return (
-            f'<span style="color:{color}; font-weight:600; '
-            f'margin:0 2px; padding:2px 4px; border-radius:4px; '
-            f'background:rgba({self._hex_to_rgb(color)},0.12);">'
+            f'<span style="display:inline-flex; align-items:center; color:{color}; '
+            f'font-weight:600; margin:3px; padding:6px 14px; border-radius:999px; '
+            f'background:rgba({self._hex_to_rgb(color)},0.14); '
+            f'border:1px solid rgba({self._hex_to_rgb(color)},0.35);">'
             f'{word}</span>'
         )
 
@@ -510,6 +535,7 @@ class LiveDisplayFormatter:
         surah: Optional[int],
         ayah: Optional[int],
         recited_text: str,
+        harakaat_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Render the current ayah, word by word, green/red against the ASR
         text. Always compares against the ACTUAL expected ayah (surah, ayah)
@@ -527,17 +553,18 @@ class LiveDisplayFormatter:
         recited_clean = self._strip_invocations(recited_text, include_basmala=include_basmala)
         rec_words = _safe_text(recited_clean).split()
 
-        status = self._update_word_status(surah, ayah, ref_words, rec_words)
+        status = self._update_word_status(surah, ayah, ref_words, rec_words, harakaat_errors=harakaat_errors)
         spans = self._render_qari_aligned(ref_words, status)
 
         body = " ".join(spans)
         return (
             f'<div dir="rtl" style="'
             f"font-family: 'Amiri', 'Traditional Arabic', 'Arial', serif; "
-            f'font-size: 26px; line-height: 2.2; text-align: right; '
-            f'padding: 20px; border-radius: 12px; '
-            f'background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); '
-            f'border: 1px solid #334155; min-height: 100px;">'
+            f'font-size: 24px; text-align: right; display: flex; flex-wrap: wrap; '
+            f'justify-content: flex-end; align-content: flex-start; '
+            f'padding: 20px; border-radius: 16px; '
+            f'background: linear-gradient(135deg, #141c2b 0%, #0f1622 100%); '
+            f'border: 1px solid rgba(79,179,196,0.22); min-height: 100px;">'
             f'{body}</div>'
         )
 
@@ -603,10 +630,11 @@ class LiveDisplayFormatter:
         return (
             f'<div dir="rtl" style="'
             f"font-family: 'Amiri', 'Traditional Arabic', 'Arial', serif; "
-            f'font-size: 26px; line-height: 2.2; text-align: right; '
-            f'padding: 20px; border-radius: 12px; '
-            f'background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); '
-            f'border: 1px solid #334155; min-height: 100px;">'
+            f'font-size: 24px; text-align: right; display: flex; flex-wrap: wrap; '
+            f'justify-content: flex-end; align-content: flex-start; '
+            f'padding: 20px; border-radius: 16px; '
+            f'background: linear-gradient(135deg, #141c2b 0%, #0f1622 100%); '
+            f'border: 1px solid rgba(79,179,196,0.22); min-height: 100px;">'
             f'{body}</div>'
         )
 
@@ -664,10 +692,10 @@ class LiveDisplayFormatter:
         return (
             f'<div dir="rtl" style="'
             f"font-family: 'Amiri', 'Traditional Arabic', 'Arial', serif; "
-            f'font-size: 22px; line-height: 2; text-align: center; '
-            f'padding: 24px; color: #64748b; border-radius: 12px; '
-            f'background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); '
-            f'border: 1px solid #334155; min-height: 100px;">'
+            f'font-size: 20px; line-height: 2; text-align: center; '
+            f'padding: 24px; color: #8fa3b8; border-radius: 16px; '
+            f'background: linear-gradient(135deg, #141c2b 0%, #0f1622 100%); '
+            f'border: 1px solid rgba(79,179,196,0.22); min-height: 100px;">'
             f'<em>{text}</em></div>'
         )
 
@@ -695,9 +723,9 @@ class LiveDisplayFormatter:
     grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
     gap: 12px;
     padding: 16px;
-    border-radius: 12px;
-    background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
-    border: 1px solid #334155;
+    border-radius: 16px;
+    background: linear-gradient(135deg, #141c2b 0%, #0f1622 100%);
+    border: 1px solid rgba(79,179,196,0.22);
     font-family: 'Inter', 'Segoe UI', sans-serif;
 ">
     <div style="text-align:center; padding:12px; border-radius:8px; background:rgba(16,185,129,0.1); border:1px solid rgba(16,185,129,0.3);">
