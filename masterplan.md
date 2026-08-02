@@ -422,3 +422,62 @@ Fixes made, both scoped to the `"equal"`-tag comparison in
 - No change to non-last words, no change to the `makhraj_error` /
   `replace`/`insert`/`delete` branches, no change to
   `hybrid_diacritic_pipeline.py`.
+
+**2026-08-02 (later same day, fourth round) — `api/` (mobile FastAPI
+layer) wired up for Combined Mode (Claude, chat), per Hamza.**
+
+Audit finding: `api/main.py` and `api/formatters.py` predated Combined
+Mode entirely — `StartSessionRequest` had no `asr_engine` field, the WS
+stream and `/transcribe` only ever called the standard decode path, and
+`chunk_result_to_json()` never read `ChunkResult.harakaat_errors` /
+`harakaat_error_count` even though `session_manager.py` had carried those
+fields since §4.1. A mobile client had no way to request Combined Mode or
+see harakaat data even if it could.
+
+Fixes made:
+1. **`realtime_streamer.py`** — added `self._last_qari_action` (init to
+   `None` in `__init__`), set at the end of `process_chunk_combined()`'s
+   qari_mode branch to whatever `correction_engine.process_verdict()`
+   returned. Needed because the API's existing qari relay only inferred a
+   `"pause"` action from `get_pending_corrections()`, which stays empty for
+   a `"hint"` (harakaat-only) action — there was no way to see that action
+   fired at all without capturing the real returned dict. `process_chunk()`
+   (standard) itself is untouched.
+2. **`api/main.py`**:
+   - `StartSessionRequest` gained `asr_engine: str = "standard"` (falls
+     back to `"standard"` on any other value, same tolerance as app.py's
+     `_parse_asr_engine()`). `start_session()` stores it in a new
+     `_active_session_asr_engine` global and, on `"combined"`,
+     synchronously calls `hybrid_diacritic_pipeline.preload_local_pipeline()`
+     before returning — mirrors `start_live_session()`'s preload in app.py
+     so the first WS chunk isn't slowed by a cold model load. Also resets
+     `correction_engine` + `_vad_paused` + `_last_qari_action` when
+     `qari_mode` is on, matching app.py's Qari Mode session-start reset.
+   - Added `_process_one_chunk()` — single dispatch point (standard vs
+     `process_chunk_combined`) used by both the WS loop and the flush loop
+     in `_finalize_active_session()`, so they can't drift out of sync on
+     which engine a session is actually using.
+   - WS stream: when `asr_engine == "combined"` and `qari_mode` is on, the
+     qari-action relay now reads `rt_streamer._last_qari_action` (covers
+     both `"pause"` and the new `"hint"`) instead of only synthesizing a
+     `"pause"` guess from pending corrections; standard mode keeps the
+     original pending-corrections-based relay unchanged.
+   - `/transcribe` gained `asr_engine: str = Form("standard")`. On
+     `"combined"`, decodes via `hybrid_diacritic_pipeline.run_combined_transcription()`
+     instead of `rt_streamer._decode_raw()`, then runs
+     `harakaat_error_detector.detect_harakaat_errors()` against the matched
+     ayah and includes `harakaat_errors` / `harakaat_error_count` in the
+     response (`[]` / `0` on standard calls, never omitted).
+3. **`api/formatters.py`** — `chunk_result_to_json()` now includes
+   `harakaat_errors` (defaulting `[]`, never `null`) and
+   `harakaat_error_count` read straight off `ChunkResult`.
+   `qari_action_to_json()` now also passes through `harakaat_errors` from
+   the correction-engine action dict, alongside the existing
+   `wrong_words`.
+4. **`api/README.md`** — updated to document `asr_engine` on both
+   `/transcribe` and `/session/start`, the new response/message fields, the
+   `"hint"` qari-action, and a note in the mobile-pipeline walkthrough.
+
+Not done: no mobile-side (Expo) code exists yet to actually consume any of
+this — this round only closes the server-side gap so the API can serve a
+Combined Mode client whenever that's built.

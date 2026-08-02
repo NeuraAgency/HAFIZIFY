@@ -33,6 +33,14 @@ def chunk_result_to_json(result: ChunkResult, session: RecitationSession) -> Dic
         "verdict": result.verdict,
         "errors": result.errors,
         "surah_lock_state": result.surah_lock_state,
+        # Combined Mode only (masterplan.md §4.1/§3.2) — always present but
+        # empty/zero on Standard mode chunks, since ChunkResult defaults
+        # harakaat_errors=None and harakaat_error_count=0 for those. Each
+        # entry is {index, predicted, reference, status} — status is always
+        # "harakaat_error" here since process_chunk_combined() already
+        # filters to just the mistakes (see realtime_streamer.py).
+        "harakaat_errors": result.harakaat_errors or [],
+        "harakaat_error_count": result.harakaat_error_count,
         # session-level tracking, echoed per chunk so the client never has
         # to reconstruct it from a stream of partial updates
         "session": {
@@ -43,7 +51,15 @@ def chunk_result_to_json(result: ChunkResult, session: RecitationSession) -> Dic
 
 
 def qari_action_to_json(correction_result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Pass through the Qari-mode correction engine's action, if any, as JSON."""
+    """Pass through the Qari-mode correction engine's action, if any, as JSON.
+
+    Covers both the existing word-error flow (action="pause"/"retry"/etc.,
+    wrong_words populated) and Combined Mode's harakaat-only flow
+    (action="hint", correction_engine._handle_harakaat_hint() —
+    masterplan.md §4.4/Phase 5): that action never touches wrong_words, it
+    carries harakaat_errors instead, so both are passed through here rather
+    than assuming one or the other is always present.
+    """
     if not correction_result:
         return None
     return {
@@ -51,6 +67,7 @@ def qari_action_to_json(correction_result: Optional[Dict[str, Any]]) -> Optional
         "action": correction_result.get("action"),
         "message": correction_result.get("message"),
         "wrong_words": correction_result.get("wrong_words"),
+        "harakaat_errors": correction_result.get("harakaat_errors"),
     }
 
 

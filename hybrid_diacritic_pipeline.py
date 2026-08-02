@@ -111,7 +111,8 @@ def transcribe_groq(chunk_numpy: np.ndarray, sample_rate: int = 16000) -> str:
     """Undiacritized consonant-backbone transcription via the existing Groq client."""
     try:
         return get_groq_transcriber().transcribe_array(chunk_numpy, sample_rate=sample_rate)
-    except Exception:
+    except Exception as e:
+        print(f"[Combined Mode] Groq transcription failed, returning empty text: {e!r}")
         return ""
 
 
@@ -124,7 +125,9 @@ def transcribe_local(chunk_numpy: np.ndarray, sample_rate: int = 16000) -> str:
             generate_kwargs={"task": "transcribe", "language": "arabic"},
         )
         return result["text"].strip()
-    except Exception:
+    except Exception as e:
+        print(f"[Combined Mode] Local model transcription failed, returning empty text "
+              f"(chunk length {len(chunk_numpy) / sample_rate:.2f}s): {e!r}")
         return ""
 
 
@@ -279,6 +282,40 @@ def run_hybrid_combination_logic(groq_raw_text: str, local_raw_text: str) -> str
 
 
 # ---------------------------------------------------------------------------
+# Anti-hallucination guard
+# ---------------------------------------------------------------------------
+
+def _collapse_exact_repeats(text: str) -> str:
+    """Collapse a transcript that is an exact word-for-word repeat of a
+    shorter phrase down to a single occurrence.
+
+    Whisper (both OpenAI's and Groq's hosted whisper-large-v3) has a known
+    failure mode of repeating the last phrase it heard into trailing/leading
+    silence within its fixed-size decode window, especially on short clips
+    at temperature=0.0. Groq's REST API doesn't expose the HF-only
+    repetition_penalty / no_repeat_ngram_size generate() kwargs that guard
+    against this elsewhere in the codebase, so this catches it after the
+    fact instead, on whichever engine's raw text triggered it.
+
+    Deliberately conservative: only collapses an EXACT, whole-sequence
+    repeat (the word list tiles perfectly into 2+ identical blocks). A
+    genuinely different second half — e.g. two different ayahs recited
+    back to back — will not tile exactly and is left untouched.
+    """
+    words = text.strip().split()
+    n = len(words)
+    if n < 2:
+        return text
+    for repeat_len in range(1, n // 2 + 1):
+        if n % repeat_len != 0:
+            continue
+        block = words[:repeat_len]
+        if all(words[i:i + repeat_len] == block for i in range(0, n, repeat_len)):
+            return " ".join(block)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Public entry point — this is what the app calls per VAD chunk
 # ---------------------------------------------------------------------------
 
@@ -292,7 +329,18 @@ def run_combined_transcription(chunk_numpy: np.ndarray, sample_rate: int = 16000
         groq_text = groq_future.result()
         local_text = local_future.result()
 
+    # Guard both sides against the trailing-silence repeat hallucination
+    # before they ever reach the merge — see _collapse_exact_repeats().
+    groq_text = _collapse_exact_repeats(groq_text)
+    local_text = _collapse_exact_repeats(local_text)
+
     combined_text = run_hybrid_combination_logic(groq_text, local_text) if groq_text else local_text
+
+    if groq_text and local_text and combined_text == groq_text and DIACRITICS_PATTERN.search(local_text) and not DIACRITICS_PATTERN.search(combined_text):
+        print(
+            "[Combined Mode] Merge produced zero diacritic injections despite local "
+            f"having them — groq_text={groq_text!r} local_text={local_text!r}"
+        )
 
     return {
         "groq_text": groq_text,

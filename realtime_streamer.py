@@ -347,6 +347,14 @@ class RealtimeStreamer:
         
         self._vad_paused = False
         self.correction_engine = CorrectionEngine(on_state_change=self._on_correction_state_change)
+        # Last dict returned by correction_engine.process_verdict() from
+        # process_chunk_combined() (Qari Mode only). Combined Mode's WS API
+        # layer needs this to relay HARAKAAT_HINT actions to the mobile
+        # client — Standard mode's existing get_pending_corrections()-based
+        # relay doesn't cover that action, since a harakaat hint never adds
+        # anything to _pending_wrong_words. None until the first Combined +
+        # Qari Mode chunk runs; not touched by process_chunk() (standard).
+        self._last_qari_action: Optional[dict] = None
 
     def _on_correction_state_change(self, state: str):
         print(f"[CorrectionEngine] State → {state}")
@@ -731,6 +739,28 @@ class RealtimeStreamer:
             start += chunk_size - overlap
 
         return " ".join(parts)
+
+    def ensure_ayah_map_loaded(self):
+        """Load just the ayah reference map, independent of any ASR model.
+
+        Combined Mode doesn't use rt_streamer's own model at all (it uses
+        Groq + the separate local turbo pipeline in
+        hybrid_diacritic_pipeline.py), so nothing in that call path
+        otherwise triggers _ensure_model_loaded(). guard_inference() still
+        needs self._ayah_map for reference-text matching though. Standard
+        mode gets this as a side effect of _ensure_model_loaded(); this
+        covers Combined Mode being used before any Standard-mode call (or
+        /session/start, which always calls _ensure_model_loaded() via
+        create_session()) has ever warmed up this instance, which otherwise
+        left _ayah_map as None and made every Combined-mode /transcribe
+        call silently skip ayah matching (matched_ayah/confidence/verdict
+        all stuck at their unmatched defaults).
+        """
+        if self._ayah_map is not None:
+            return
+        if os.path.isfile(self.ayah_json_path):
+            self._ayah_map = load_all_ayat_json(self.ayah_json_path)
+            print(f"[RealtimeStreamer] Loaded {len(self._ayah_map)} ayahs (ayah-map-only load)")
 
     def create_session(
         self,
@@ -1248,6 +1278,7 @@ class RealtimeStreamer:
                 confidence=float(guard_result.get("confidence") or 1.0),
                 harakaat_errors=guard_result.get("harakaat_errors"),
             )
+            self._last_qari_action = correction_result
             if correction_result["action"] == "pause":
                 self._vad_paused = True
             elif correction_result["action"] in ("continue", "skip"):
