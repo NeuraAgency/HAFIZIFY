@@ -22,6 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl git \
     && rm -rf /var/lib/apt/lists/*
 
+# Docker Desktop/WSL2's container networking hands out IPv6 addresses for
+# hosts like download.pytorch.org's CDN, but doesn't actually route IPv6
+# traffic -- so pip tries the (broken) IPv6 address first and stalls/fails
+# instead of falling back to the working IPv4 one. This tells glibc's
+# getaddrinfo() (what pip/curl use for DNS) to prefer IPv4 when both exist.
+RUN echo "precedence ::ffff:0:0/96 100" >> /etc/gai.conf
+
 # This container has no real sound card, so pygame.mixer.init() would still
 # fail trying to open one. SDL_AUDIODRIVER=dummy tells SDL (which pygame
 # wraps) to use a no-op virtual audio device instead -- mixer.init()
