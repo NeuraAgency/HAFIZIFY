@@ -485,6 +485,15 @@ async def stream_session(websocket: WebSocket, session_id: str):
             pcm16 = np.frombuffer(raw_bytes, dtype="<i2")
             audio_fragment = (pcm16.astype(np.float32) / 32768.0)
 
+            # DIAGNOSTIC: confirms whether real audio signal is arriving at
+            # all, before VAD/ASR even get involved. peak_amp near 0.0 means
+            # the client is sending silence/empty buffers — not a VAD or
+            # server bug. A real recorded voice typically peaks well above
+            # 0.02–0.05 even in quiet rooms.
+            peak_amp = float(np.abs(audio_fragment).max()) if len(audio_fragment) else 0.0
+            print(f"[WS audio] {len(pcm16)} samples ({len(pcm16)/16000:.2f}s) | peak_amp={peak_amp:.5f}"
+                  + ("  <-- SILENCE, check client audio capture/encoding" if peak_amp < 0.01 else ""))
+
             ready_chunks = session.feed_audio(audio_fragment)
 
             for chunk_audio, start, end in ready_chunks:
