@@ -15,6 +15,7 @@ import uuid
 import json
 import re
 import difflib
+import threading
 import numpy as np
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any, Set, Tuple
@@ -190,6 +191,16 @@ class RecitationSession:
         self._total_samples_fed = 0
         self._next_chunk_start = 0
         self._chunk_index = 0
+
+        # Guards feed_audio() (called from the mic-stream callback) and
+        # flush_remaining_audio() (called from the Stop handler) so they can
+        # never run concurrently on this session's shared buffers/VAD model.
+        # Gradio can fire the final stream() fragment right as stop_recording()
+        # fires, and without this lock both paths mutate the same numpy
+        # buffers and call the same torch VAD model at once — that race is
+        # what was corrupting the heap ("double free"/"corrupted double-linked
+        # list") on Stop. (2026-08-03, Claude/chat, per Hamza)
+        self._audio_lock = threading.Lock()
 
         # Full session recording
         self._all_audio = np.array([], dtype=np.float32)
@@ -437,20 +448,21 @@ class RecitationSession:
         if not self.is_active:
             return []
 
-        # Ensure float32, mono
-        if audio_fragment.ndim > 1:
-            audio_fragment = audio_fragment.mean(axis=1)
-        audio_fragment = audio_fragment.astype(np.float32)
+        with self._audio_lock:
+            # Ensure float32, mono
+            if audio_fragment.ndim > 1:
+                audio_fragment = audio_fragment.mean(axis=1)
+            audio_fragment = audio_fragment.astype(np.float32)
 
-        # Append to buffer and full session recording
-        self._buffer = np.concatenate([self._buffer, audio_fragment])
-        self._all_audio = np.concatenate([self._all_audio, audio_fragment])
-        self._total_samples_fed += len(audio_fragment)
+            # Append to buffer and full session recording
+            self._buffer = np.concatenate([self._buffer, audio_fragment])
+            self._all_audio = np.concatenate([self._all_audio, audio_fragment])
+            self._total_samples_fed += len(audio_fragment)
 
-        if self.use_vad and self._vad_model is not None:
-            return self._feed_audio_vad()
+            if self.use_vad and self._vad_model is not None:
+                return self._feed_audio_vad()
 
-        return self._feed_audio_fixed()
+            return self._feed_audio_fixed()
 
     def _feed_audio_vad(self) -> List[tuple]:
         """VAD-based chunking with automatic segment merging.
@@ -508,53 +520,58 @@ class RecitationSession:
 
         remaining_chunks = []
 
-        if self.use_vad and self._vad_model is not None:
-            window_start = self._vad_committed_up_to
-            window_audio = self._all_audio[window_start:]
-            total_len = len(self._all_audio)
+        # Same lock as feed_audio() — blocks here until any in-flight mic
+        # fragment currently being fed by the stream() callback has fully
+        # finished mutating the shared buffers / calling VAD, instead of
+        # racing it.
+        with self._audio_lock:
+            if self.use_vad and self._vad_model is not None:
+                window_start = self._vad_committed_up_to
+                window_audio = self._all_audio[window_start:]
+                total_len = len(self._all_audio)
 
-            if len(window_audio) >= int(0.2 * SAMPLE_RATE):
-                timestamps = self._run_vad_on_window(window_audio)
-                if timestamps:
-                    # On flush, no tail confirmation needed — session ending
-                    remaining_chunks.extend(
-                        self._merge_and_emit(
-                            timestamps, window_start, total_len,
-                            tail_confirm=0,
+                if len(window_audio) >= int(0.2 * SAMPLE_RATE):
+                    timestamps = self._run_vad_on_window(window_audio)
+                    if timestamps:
+                        # On flush, no tail confirmation needed — session ending
+                        remaining_chunks.extend(
+                            self._merge_and_emit(
+                                timestamps, window_start, total_len,
+                                tail_confirm=0,
+                            )
                         )
+
+                # Safety net: emit anything VAD missed
+                leftover_start = self._vad_committed_up_to
+                leftover_audio = self._all_audio[leftover_start:]
+
+                if len(leftover_audio) >= int(0.3 * SAMPLE_RATE):
+                    result = self._emit_segment(
+                        leftover_start,
+                        len(self._all_audio),
+                        len(self._all_audio),
+                        label="vad_tail",
                     )
+                    self._vad_segment_counter += 1
+                    self._vad_committed_up_to = len(self._all_audio)
 
-            # Safety net: emit anything VAD missed
-            leftover_start = self._vad_committed_up_to
-            leftover_audio = self._all_audio[leftover_start:]
-
-            if len(leftover_audio) >= int(0.3 * SAMPLE_RATE):
-                result = self._emit_segment(
-                    leftover_start,
-                    len(self._all_audio),
-                    len(self._all_audio),
-                    label="vad_tail",
-                )
-                self._vad_segment_counter += 1
-                self._vad_committed_up_to = len(self._all_audio)
-
-                if result is not None:
-                    chunk_audio, padded_start, padded_end = result
-                    pieces = self._split_long_segment(chunk_audio, padded_start)
-                    remaining_chunks.extend(pieces)
-                    print(f"[Session] Safety-net: flushed "
-                          f"{len(leftover_audio)/SAMPLE_RATE:.1f}s → "
-                          f"{len(pieces)} piece(s)")
-        else:
-            # Fixed-time: flush remainder
-            remaining_start = self._next_chunk_start
-            if remaining_start < len(self._all_audio):
-                remaining_audio = self._all_audio[remaining_start:].copy()
-                if len(remaining_audio) >= SAMPLE_RATE:
-                    remaining_chunks.append(
-                        (remaining_audio, remaining_start, len(self._all_audio))
-                    )
-                    self._next_chunk_start = len(self._all_audio)
+                    if result is not None:
+                        chunk_audio, padded_start, padded_end = result
+                        pieces = self._split_long_segment(chunk_audio, padded_start)
+                        remaining_chunks.extend(pieces)
+                        print(f"[Session] Safety-net: flushed "
+                              f"{len(leftover_audio)/SAMPLE_RATE:.1f}s → "
+                              f"{len(pieces)} piece(s)")
+            else:
+                # Fixed-time: flush remainder
+                remaining_start = self._next_chunk_start
+                if remaining_start < len(self._all_audio):
+                    remaining_audio = self._all_audio[remaining_start:].copy()
+                    if len(remaining_audio) >= SAMPLE_RATE:
+                        remaining_chunks.append(
+                            (remaining_audio, remaining_start, len(self._all_audio))
+                        )
+                        self._next_chunk_start = len(self._all_audio)
 
         return remaining_chunks
 
