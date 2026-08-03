@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -74,6 +75,19 @@ from api.formatters import (  # noqa: E402
 )
 
 app = FastAPI(title="Hafizify Mobile API")
+
+# CORS: needed for the web client (browser fetch/WS is origin-restricted;
+# React Native / Expo isn't, so this is a no-op for mobile). Wide open for
+# now since this is a pre-deployment test build behind a tunnel URL that
+# changes anyway — tighten allow_origins to your real web domain(s) once
+# you deploy.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,  # must be False when allow_origins is "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")

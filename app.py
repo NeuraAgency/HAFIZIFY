@@ -602,6 +602,7 @@ def start_live_session(
     auto_surah_detect,
     qari_mode=False,
     asr_engine="Standard (offline, fast)",
+    use_api_combined=False,
 ):
     """Initialize a new recording session when user clicks Start."""
     global _active_session, _worker_thread, _display_formatter
@@ -620,7 +621,7 @@ def start_live_session(
     # inference, which reads as a large delay right as the reciter starts
     # speaking. Groq needs no local load (cloud API), so only the local
     # turbo pipeline is preloaded here.
-    if _parse_asr_engine(asr_engine) == "combined":
+    if _parse_asr_engine(asr_engine) == "combined" and not use_api_combined:
         from hybrid_diacritic_pipeline import preload_local_pipeline
         try:
             preload_local_pipeline()
@@ -1618,7 +1619,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
             # audio upload (that race caused ffmpeg CouldntDecodeError on Record tap).
             start_session_btn.click(
                 fn=start_live_session,
-                inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_checkbox, live_asr_engine_selector],
+                inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox],
                 outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, comparison_md, surah_badge_html, correction_status_box],
             )
 
