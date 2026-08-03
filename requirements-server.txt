@@ -1,0 +1,49 @@
+# Exact versions pinned from the real hafizify/venv (Python 3.10) on 2026-08-02.
+# `gradio` dropped -- the Docker container only runs api/main.py (uvicorn),
+# never app.py's Gradio UI.
+
+# PyTorch packages installed separately in Dockerfile with CUDA 12.4 index
+# torch==2.6.0
+# torchvision==0.21.0
+# torchaudio==2.6.0
+
+transformers==4.37.2
+datasets==4.8.5
+accelerate==1.13.0
+peft==0.10.0
+soundfile==0.13.1
+librosa==0.11.0
+evaluate==0.4.6
+pandas==2.3.3
+numpy==1.26.4
+pyctcdecode==0.5.0
+rapidfuzz==3.14.5
+silero-vad==6.2.1
+# kenlm intentionally NOT pinned here, unlike the desktop venv this file was
+# frozen from. Traced its only two call sites (2026-08-02, Claude/chat, per
+# Hamza): hybrid_pipeline.py's HybridViterbiPipeline (used only by
+# realtime_streamer.py's decode_full_session(), which api/main.py never
+# calls -- and hybrid_pipeline.py isn't even in the Dockerfile's COPY list)
+# and fyp_model/beam_decoder.py (only used for the wav2vec2 model type,
+# which nothing in api/'s model registry defaults ever select). Both
+# already handle kenlm being absent via try/except -- it never loads in
+# this container. Installing it was the entire reason the Docker build was
+# failing on a from-source compile ("Python.h: No such file or directory"),
+# and even after fixing that, it's pure wasted build time for something
+# that's unreachable code in this image. pyctcdecode stays (harakaat's
+# import chain doesn't touch it either, but it's a pure-Python install with
+# no compile step, so there's no cost to leaving it, and beam_decoder.py
+# does still reference it directly -- unlike kenlm it's not worth chasing
+# down whether removing it is safe for zero benefit).
+edge-tts==7.2.8
+pygame==2.6.1
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+groq==1.4.0
+python-dotenv==1.2.2
+scipy==1.15.3
+
+# --- Mobile API (api/) ---
+fastapi==0.136.1
+uvicorn==0.46.0
+python-multipart==0.0.27

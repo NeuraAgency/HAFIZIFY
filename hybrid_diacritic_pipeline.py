@@ -81,12 +81,33 @@ def _load_local_pipeline():
     device_available = torch.cuda.is_available()
     dtype = torch.float16 if device_available else torch.float32
 
-    processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID)
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        LOCAL_MODEL_ID,
-        torch_dtype=dtype,
-        device_map="auto" if device_available else None,
-    )
+    # Try the local HF cache first (local_files_only=True) so a machine with
+    # no/unreliable internet never even attempts the network "check for
+    # updates" HEAD request. Observed failure mode without this: on a
+    # machine with DNS resolution failing (getaddrinfo failed), that request
+    # retries 5 times, fails, and leaves huggingface_hub's underlying HTTP
+    # client in a broken state ("Cannot send a request, as the client has
+    # been closed") — which silently killed every subsequent local-model
+    # call for the rest of the process's life, not just the first one. Only
+    # falls through to a real network download if nothing is cached yet
+    # (first run on a fresh machine).
+    try:
+        processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID, local_files_only=True)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            LOCAL_MODEL_ID,
+            torch_dtype=dtype,
+            device_map="auto" if device_available else None,
+            local_files_only=True,
+        )
+        print("[Combined Mode] Loaded local turbo model from HF cache (offline, no network call).")
+    except Exception as e:
+        print(f"[Combined Mode] Not found in local HF cache ({e!r}); downloading from HuggingFace Hub...")
+        processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            LOCAL_MODEL_ID,
+            torch_dtype=dtype,
+            device_map="auto" if device_available else None,
+        )
     if not device_available:
         model = model.to("cpu")
 

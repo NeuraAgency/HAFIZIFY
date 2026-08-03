@@ -125,6 +125,7 @@ class ChunkResult:
     surah_lock_state: Optional[Dict[str, Any]] = None
     harakaat_errors: Optional[list] = None
     harakaat_error_count: int = 0
+    word_errors: Optional[list] = None
 
 
 @dataclass
@@ -674,6 +675,7 @@ class RecitationSession:
             surah_lock_state=surah_lock_state,
             harakaat_errors=guard_result.get("harakaat_errors"),
             harakaat_error_count=guard_result.get("harakaat_error_count", 0),
+            word_errors=guard_result.get("word_errors"),
         )
 
         self.chunk_results.append(result)

@@ -481,3 +481,90 @@ Fixes made:
 Not done: no mobile-side (Expo) code exists yet to actually consume any of
 this — this round only closes the server-side gap so the API can serve a
 Combined Mode client whenever that's built.
+
+**2026-08-02 (later same day, fifth round) — Docker build: removed kenlm
+entirely instead of fixing its build (Claude, chat), per Hamza's "do we
+even use kenlm, it never loads" catch.**
+
+Previous two rounds (same day) had been chasing a `kenlm` from-source build
+failure (`Python.h: No such file or directory`) by adding
+`build-essential`/`cmake`/`python3-dev`/`python3.10-dev`/`libeigen3-dev` to
+the `Dockerfile`. Hamza correctly pushed back: is kenlm even reachable code
+in this image? Traced it — no. Its only two call sites are
+`hybrid_pipeline.py`'s `HybridViterbiPipeline` (used only by
+`realtime_streamer.py`'s `decode_full_session()`, which `api/main.py`
+never calls — and `hybrid_pipeline.py` isn't even in the `Dockerfile`'s
+`COPY` list) and `fyp_model/beam_decoder.py` (only used for the `wav2vec2`
+model type, which nothing in `api/`'s model registry/defaults ever
+selects). Both already handle kenlm being absent via `try/except`. It was
+never going to load in this container regardless of whether the build
+succeeded.
+
+Fix: removed `kenlm` from `requirements-server.txt` (commented, explaining
+why, so a future session doesn't re-add it during another
+freeze-from-desktop-venv pass) instead of fixing its build. Then reverted
+the `Dockerfile`'s system-deps line back down to just `python3 python3-pip
+libsndfile1 curl git` — everything else in `requirements-server.txt` ships
+prebuilt manylinux wheels for cp310, so `build-essential`/`cmake`/dev
+headers were *only* ever needed for kenlm's from-source compile. Net
+result: smaller image, faster build, and the actual root problem (wasted
+build time on unreachable code) is gone rather than papered over.
+
+`pyctcdecode` was left alone — no compile step (pure Python), so no cost
+to keeping it even though it's also not exercised by anything `api/main.py`
+calls; not worth the same audit effort for zero build-time benefit.
+
+Lesson for future rounds: when a build/dependency error shows up, check
+whether the failing package is actually reachable from the code that runs
+in that image BEFORE fixing the build — fixing the build is only the right
+move if the dependency is actually needed.
+
+**2026-08-02 (later same day, sixth round) — same audit extended to the
+desktop app (Claude, chat), per Hamza's "if we're not using kenlm at all
+please exempt it."**
+
+The round-5 Docker fix only addressed the container. Traced the same
+question for the desktop app and found the identical pattern, worse in
+scope: `HybridViterbiPipeline` (kenlm LM load + n-gram index build over all
+6235 ayahs) was being constructed **eagerly, at every model load**, in two
+places:
+- `app.py::load_models_once()` (both the Groq branch and the regular
+  branch) — its only consumer, `transcribe()`'s `viterbi_pipeline.pipeline_from_text()`
+  call, is unreachable: `app.py`'s current `gr.Blocks()` only defines the
+  "🎤️ Live Recitation" tab, no file-upload tab wires `transcribe()` to any
+  button.
+- `realtime_streamer.py::_ensure_model_loaded()` (both the groq branch and
+  the regular branch) — its only consumer, `decode_full_session()`, is
+  also unreachable: `app.py`'s `stop_live_session()` has its own comment
+  confirming the full-session re-decode/compare step was deliberately
+  removed already, and `api/main.py` never calls it either.
+
+This is what the startup log Hamza pasted was actually showing
+(`[HybridPipeline] KenLM model loaded...` / `Inverted index built: 97342
+unique bigrams+trigrams`) — real load time and memory spent on an object
+nothing in the currently-wired app ever calls a method on.
+
+Fix: made both constructions lazy instead of deleting the (currently
+unreachable but not necessarily dead-forever) code that uses them:
+- `realtime_streamer.py` — added `_ensure_viterbi_pipeline()`, called only
+  from `decode_full_session()`. Removed the two eager
+  `self._viterbi_pipeline = HybridViterbiPipeline(...)` blocks from
+  `_ensure_model_loaded()`.
+- `app.py` — added module-level `_ensure_viterbi_pipeline()`, called only
+  from `transcribe()` right before `viterbi_pipeline.pipeline_from_text()`.
+  Removed the two eager `viterbi_pipeline = HybridViterbiPipeline(...)`
+  blocks from `load_models_once()`.
+
+Result: kenlm (and the n-gram index build, which costs time regardless of
+whether kenlm itself is installed) no longer loads on desktop app startup
+or on any live/API session — only if `transcribe()` or
+`decode_full_session()` ever actually get called, which nothing currently
+does. Neither function was deleted, since both could be legitimate
+features to rewire back into the UI later (a file-upload tab, a
+full-session-compare feature) — this only fixes when their dependency
+loads, not whether the features exist.
+
+Not done: didn't touch `requirements.txt` (desktop venv) or suggest
+uninstalling kenlm from it — harmless to leave installed now that nothing
+touches it at startup, and `hybrid_pipeline.py` already degrades
+gracefully via `_KENLM_AVAILABLE` if it's ever removed.

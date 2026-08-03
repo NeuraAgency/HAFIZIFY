@@ -75,6 +75,39 @@ from api.formatters import (  # noqa: E402
 
 app = FastAPI(title="Hafizify Mobile API")
 
+
+@app.on_event("startup")
+def _warm_combined_mode_model():
+    """Preload the local turbo model at server BOOT, not on the first
+    /transcribe or WS chunk that needs it.
+
+    Without this, the very first Combined Mode request pays the full cold
+    weights-load cost (several seconds — see 'Loading weights: 100%...' in
+    the server log) on top of Groq + decode + merge time, all within one
+    request. That routinely exceeds api_client.py's client-side timeout,
+    so the caller (app.py, via process_chunk_api()) sees 'timed out' at the
+    exact moment the server is still finishing up and about to return 200
+    OK a few seconds later — it looks broken but isn't. This mirrors what
+    app.py's start_live_session() and this file's own /session/start
+    handler already do for the desktop app / live-session path; /transcribe
+    never went through either of those, so it never got the same warm-up.
+
+    Runs in a background thread so a slow model load never delays the
+    server actually accepting connections; the first real request just
+    waits on _local_pipeline being ready if it beats the thread.
+    """
+    import threading
+    from hybrid_diacritic_pipeline import preload_local_pipeline
+
+    def _preload():
+        try:
+            preload_local_pipeline()
+            print("[API] Combined Mode local model preloaded at server startup.")
+        except Exception as e:
+            print(f"[API] Combined Mode preload at startup failed, will lazy-load on first request: {e}")
+
+    threading.Thread(target=_preload, daemon=True).start()
+
 # ---------------------------------------------------------------------------
 # Shared engine state — one process, one model in memory, one live session
 # at a time (see module docstring for why).
@@ -455,7 +488,15 @@ async def stream_session(websocket: WebSocket, session_id: str):
                         # corrections check below can't see since a harakaat
                         # hint never touches _pending_wrong_words.
                         action_json = qari_action_to_json(rt_streamer._last_qari_action)  # noqa: SLF001
-                        if action_json and action_json.get("action") in ("pause", "hint"):
+                        if action_json:
+                            # Relay every action (pause/hint/continue/retry/
+                            # skip), not just pause/hint. correction_engine.py
+                            # legitimately returns "continue" (correction
+                            # verified, resume listening) and "retry" (still
+                            # wrong, replay correction) too — a client that
+                            # paused its mic on "pause" needs one of those to
+                            # know when it's safe to resume, or it stays
+                            # paused forever.
                             await websocket.send_json(action_json)
                     else:
                         pending = rt_streamer.correction_engine.get_pending_corrections()

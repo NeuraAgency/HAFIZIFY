@@ -1,0 +1,82 @@
+# Docker build context excludes — trims what gets uploaded to the Docker
+# daemon before the build even starts, and keeps local-only / runtime-only
+# data out of it entirely. Mirrors .gitignore's local/large-file patterns,
+# plus a few things .gitignore doesn't need to worry about (.git itself,
+# CI config) but a Docker build context includes by default unless told
+# otherwise.
+#
+# IMPORTANT: this only affects `docker build`'s context — it has zero
+# effect on docker-compose.yml's `volumes:` mount, which happens at
+# container runtime and reads straight from the host filesystem. Excluding
+# whisper-l-v3-turbo-quran-lora-dataset-mix/ below does NOT break that
+# volume mount; it just stops that ~1.6GB+ folder from being uploaded as
+# build context uselessly, since the Dockerfile never COPYs it (see its
+# commented-out COPY line — it's intentionally left out of the image).
+
+# ── VCS / CI ────────────────────────────────────────────────────────────
+.git/
+.github/
+
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments (huge — the image builds its own deps fresh) ────
+venv/
+.venv/
+env/
+.env/
+
+# ── Secrets — docker-compose's env_file reads .env straight off disk at
+#    container-start time, never through the build context ──────────────
+.env
+.env.local
+.env.production
+
+# ── Runtime session data (generated at runtime, not source code) ────────
+recordings/
+audio_cache/
+
+# ── Local model folders — none of these are COPY'd into the image; the
+#    turbo model is mounted as a read-only volume by docker-compose.yml
+#    instead (see Dockerfile's commented-out COPY line), and the others
+#    aren't on api/main.py's import chain at all ─────────────────────────
+whisper-base-ar-quran/
+whisper-base-quran-lora/
+whisper-base-quran-lora-ct2/
+whisper-l-v3-turbo-quran-lora-dataset-mix/
+qdat_models/
+
+# ── Misc large/irrelevant data & caches ──────────────────────────────────
+data/
+scripts/
+.cache/
+*/.cache/
+*/runs/
+
+# ── OS & editor artefacts ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Logs & temp ────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.temp

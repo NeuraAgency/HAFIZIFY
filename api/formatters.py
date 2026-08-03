@@ -41,6 +41,10 @@ def chunk_result_to_json(result: ChunkResult, session: RecitationSession) -> Dic
         # filters to just the mistakes (see realtime_streamer.py).
         "harakaat_errors": result.harakaat_errors or [],
         "harakaat_error_count": result.harakaat_error_count,
+        # Per-word verdicts (correct/minor/major/missing/extra) against the
+        # matched ayah — same shape as /transcribe's word_errors, now also
+        # populated on every streamed chunk (see realtime_streamer.py).
+        "word_errors": result.word_errors or [],
         # session-level tracking, echoed per chunk so the client never has
         # to reconstruct it from a stream of partial updates
         "session": {

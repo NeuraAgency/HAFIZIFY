@@ -188,7 +188,14 @@ def _process_queue_worker():
             continue
 
         try:
-            if len(task) == 5:
+            # Task tuple has grown over time (masterplan.md §9 added the
+            # remote-API fields) — unpack by length, oldest shape first, so
+            # nothing already queued in an older shape ever breaks.
+            use_api_combined = False
+            api_base_url = "http://127.0.0.1:8000"
+            if len(task) == 7:
+                session, chunk_tuple, correction_mode, qari_mode, asr_engine, use_api_combined, api_base_url = task
+            elif len(task) == 5:
                 session, chunk_tuple, correction_mode, qari_mode, asr_engine = task
             elif len(task) == 4:
                 session, chunk_tuple, correction_mode, qari_mode = task
@@ -211,7 +218,14 @@ def _process_queue_worker():
                 print(f"[Worker] Dropped stale chunk (Qari state={rt_streamer.correction_engine.state})")
                 continue
 
-            if asr_engine == "combined":
+            if asr_engine == "combined" and use_api_combined:
+                rt_streamer.process_chunk_api(
+                    session, chunk_audio, correction_mode=correction_mode,
+                    qari_mode=qari_mode,
+                    chunk_start_sample=chunk_start, chunk_end_sample=chunk_end,
+                    api_base_url=api_base_url or "http://127.0.0.1:8000",
+                )
+            elif asr_engine == "combined":
                 rt_streamer.process_chunk_combined(
                     session, chunk_audio, correction_mode=correction_mode,
                     qari_mode=qari_mode,
@@ -256,11 +270,10 @@ def load_models_once(model_choice="whisper-base-quran-lora"):
         _forced_decoder_ids = None
         _current_model_choice = model_choice
         print(f"[Hafizify] Groq whisper-large-v3 ready (cloud API).")
-        # Still load ayah map + surah detector
+        # Still load ayah map + surah detector (HybridViterbiPipeline/kenlm
+        # moved to _ensure_viterbi_pipeline(), built lazily on first actual
+        # transcribe() call instead — see that function's note)
         ayah_path = os.path.join(BASE_DIR, "fyp_model", "all_ayat.json")
-        lm_path = os.path.join(BASE_DIR, "quran_5gram.arpa")
-        if viterbi_pipeline is None:
-            viterbi_pipeline = HybridViterbiPipeline(ayah_path, lm_path)
         if ayah_map is None and os.path.isfile(ayah_path):
             ayah_map = load_all_ayat_json(ayah_path)
         if SURAH_DETECTOR is None and os.path.isfile(ayah_path):
@@ -315,10 +328,12 @@ def load_models_once(model_choice="whisper-base-quran-lora"):
     print(f"[Hafizify] Model ready: {model_path} on {device}")
 
     ayah_path = os.path.join(BASE_DIR, "fyp_model", "all_ayat.json")
-    lm_path = os.path.join(BASE_DIR, "quran_5gram.arpa")
-
-    if viterbi_pipeline is None:
-        viterbi_pipeline = HybridViterbiPipeline(ayah_path, lm_path)
+    # HybridViterbiPipeline/kenlm moved to _ensure_viterbi_pipeline(), built
+    # lazily on first actual transcribe() call instead — see that function's
+    # note (2026-08-02, Claude/chat, per Hamza's "we don't even use kenlm"
+    # catch: this was loading a kenlm LM + 97k-bigram/trigram n-gram index
+    # at every model load even though nothing in the live-session flow ever
+    # calls it, and the file-upload tab that does isn't wired to the UI).
 
     if ayah_map is None and os.path.isfile(ayah_path):
         ayah_map = load_all_ayat_json(ayah_path)
@@ -418,6 +433,26 @@ def _parse_asr_engine(engine_str: str) -> str:
 # File Upload Transcription (original functionality)
 # ---------------------------------------------------------------------------
 
+def _ensure_viterbi_pipeline():
+    """Lazily build the module-level viterbi_pipeline on first actual use.
+
+    Only transcribe() (the file-upload tab) calls this. Moved out of
+    load_models_once() (2026-08-02, Claude/chat, per Hamza) because it was
+    building a HybridViterbiPipeline — n-gram index over 6235 ayahs plus a
+    KenLM LM load — unconditionally at every model load, even though the
+    file-upload tab that calls it isn't currently wired to any UI button
+    (only the Live Recitation tab is defined in this file's gr.Blocks()),
+    and the live-session flow itself never touches viterbi_pipeline at all.
+    Kept, not deleted, in case that tab gets rewired to the UI later.
+    """
+    global viterbi_pipeline
+    if viterbi_pipeline is not None:
+        return
+    ayah_path = os.path.join(BASE_DIR, "fyp_model", "all_ayat.json")
+    lm_path = os.path.join(BASE_DIR, "quran_5gram.arpa")
+    viterbi_pipeline = HybridViterbiPipeline(ayah_path, lm_path)
+
+
 def transcribe(
     audio_path,
     model_choice,
@@ -515,6 +550,7 @@ def transcribe(
         )
 
         # Run sequence alignment pipeline (no global matching)
+        _ensure_viterbi_pipeline()
         viterbi_result = viterbi_pipeline.pipeline_from_text(guard_corrected)
         
         # Format the continuous reconstructed sequence
@@ -761,7 +797,7 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
     )
 
 
-def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine):
+def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="http://127.0.0.1:8000"):
     """Called by Gradio's streaming mic with each audio fragment.
 
     audio_data is a tuple (sample_rate, numpy_array) from Gradio.
@@ -887,7 +923,10 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine):
     for chunk_tuple in ready_chunks:
         chunk_audio, chunk_start, chunk_end = chunk_tuple
         session_ref.register_pending_chunk(chunk_start, chunk_end)
-        _chunk_queue.put((session_ref, chunk_tuple, correction_mode, qari_mode, _parse_asr_engine(asr_engine)))
+        _chunk_queue.put((
+            session_ref, chunk_tuple, correction_mode, qari_mode,
+            _parse_asr_engine(asr_engine), bool(use_api_combined), api_base_url,
+        ))
 
     # Build color-coded merged HTML display
     chunk_dicts = session_ref.get_chunk_results_as_dicts()
@@ -1024,7 +1063,7 @@ def _build_live_ui_snapshot(session):
     return expected_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed, badge_html
 
 
-def stop_live_session(correction_mode, qari_mode, asr_engine):
+def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="http://127.0.0.1:8000"):
     """Drain the queue (yielding updates), then return all 13 UI outputs with full results."""
     global _active_session
 
@@ -1046,7 +1085,10 @@ def stop_live_session(correction_mode, qari_mode, asr_engine):
         for chunk_tuple in remaining:
             chunk_audio, chunk_start, chunk_end = chunk_tuple
             session.register_pending_chunk(chunk_start, chunk_end)
-            _chunk_queue.put((session, chunk_tuple, correction_mode, qari_mode, _parse_asr_engine(asr_engine)))
+            _chunk_queue.put((
+                session, chunk_tuple, correction_mode, qari_mode,
+                _parse_asr_engine(asr_engine), bool(use_api_combined), api_base_url,
+            ))
         print(f"[Session] {len(remaining)} final chunk(s) queued; waiting for ALL chunks…")
 
         # ---- 2. Yield updates while worker processes remaining chunks ----
@@ -1430,6 +1472,18 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                                 label="🎯 Active Tajweed Detection",
                                 info="On: Combined Groq + Local, harakaat-aware (needs internet). Off: local offline model.",
                             )
+                            use_api_combined_checkbox = gr.Checkbox(
+                                value=False,
+                                label="🌐 Use Remote API for Combined Mode",
+                                info="Send Combined Mode chunks to a running api/main.py server (POST /transcribe) "
+                                     "instead of loading Groq + the local turbo model in this process. Ignored in "
+                                     "Standard Mode.",
+                            )
+                            api_base_url_input = gr.Textbox(
+                                value="http://127.0.0.1:8000",
+                                label="API Base URL",
+                                info="Only used when 'Use Remote API for Combined Mode' is on.",
+                            )
                             close_settings_btn = gr.Button("Close", elem_classes=["settings-close-btn"], size="sm")
 
                     with gr.Accordion("⚙️ Chunk Settings", open=False, visible=False):
@@ -1570,13 +1624,13 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
 
             mic_input.stream(
                 fn=process_streaming_audio,
-                inputs=[mic_input, live_correction_mode, qari_mode_checkbox, live_asr_engine_selector],
+                inputs=[mic_input, live_correction_mode, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox, api_base_url_input],
                 outputs=[live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html, correction_status_box],
             )
 
             mic_input.stop_recording(
                 fn=stop_live_session,
-                inputs=[live_correction_mode, qari_mode_checkbox, live_asr_engine_selector],
+                inputs=[live_correction_mode, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox, api_base_url_input],
                 outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
                          corrected_box, chunks_table_md, comparison_md,
                          session_eval_json, guessed_surah_box, surah_badge_html, session_audio_output, correction_status_box],

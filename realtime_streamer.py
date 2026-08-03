@@ -57,6 +57,7 @@ from fyp_model.quran_guard import (
 )
 from surah_detector import SurahCandidate, SurahDetector, SurahLockManager
 from correction_engine import CorrectionEngine
+from api_client import transcribe_via_api
 
 # Whisper hard limit: 30 seconds at 16kHz
 _WHISPER_MAX_SAMPLES = 30 * SAMPLE_RATE  # 480,000 samples
@@ -192,6 +193,58 @@ def _correction_span_from_annotations(annotations, start_idx: int, end_idx: int)
     }
 
 
+def _wrong_words_and_spans_from_word_errors(annotations: list) -> tuple:
+    """Group consecutive major/missing word-error annotations into teachable
+    phrases. Shared by _apply_qari_word_scoring() (Combined Mode, local
+    decode) and process_chunk_api() (masterplan.md §9 — remote /transcribe)
+    so this grouping logic exists in exactly one place rather than being
+    copied a third time. Returns (wrong_words, correction_spans).
+    """
+    wrong_words = []
+    correction_spans = []
+    if not annotations:
+        return wrong_words, correction_spans
+
+    first_teachable_idx = next(
+        (
+            i
+            for i, a in enumerate(annotations)
+            if a.get("status") in ("major", "missing")
+            and a.get("reference")
+        ),
+        None,
+    )
+    if first_teachable_idx is None:
+        return wrong_words, correction_spans
+
+    phrase_parts = []
+    phrase_start_idx = first_teachable_idx
+    for i, ann in enumerate(annotations[first_teachable_idx:], first_teachable_idx):
+        if i > first_teachable_idx and ann.get("status") == "correct":
+            break
+        status = ann.get("status")
+        ref_word = ann.get("reference")
+        if status in ("major", "missing") and ref_word:
+            phrase_parts.append(ref_word)
+            continue
+        if status not in ("extra", "uncertain") and phrase_parts:
+            wrong_words.append(" ".join(phrase_parts))
+            correction_spans.append(
+                _correction_span_from_annotations(annotations, phrase_start_idx, i - 1)
+            )
+            phrase_parts = []
+    if phrase_parts:
+        wrong_words.append(" ".join(phrase_parts))
+        correction_spans.append(
+            _correction_span_from_annotations(
+                annotations,
+                phrase_start_idx,
+                min(len(annotations) - 1, phrase_start_idx + len(phrase_parts) - 1),
+            )
+        )
+    return wrong_words, correction_spans
+
+
 def _apply_qari_word_scoring(guard_result: dict, analysis_text: str) -> None:
     """Qari Mode word-level teachable-phrase scoring for Combined Mode
     (masterplan.md changelog, 2026-08-02 — wiring qari_mode into
@@ -221,41 +274,7 @@ def _apply_qari_word_scoring(guard_result: dict, analysis_text: str) -> None:
             guard_result["corrected_text"] = hyp_text
             guard_result["display_text"] = hyp_text
 
-        first_teachable_idx = next(
-            (
-                i
-                for i, a in enumerate(annotations)
-                if a.get("status") in ("major", "missing")
-                and a.get("reference")
-            ),
-            None,
-        )
-        if first_teachable_idx is not None:
-            phrase_parts = []
-            phrase_start_idx = first_teachable_idx
-            for i, ann in enumerate(annotations[first_teachable_idx:], first_teachable_idx):
-                if i > first_teachable_idx and ann.get("status") == "correct":
-                    break
-                status = ann.get("status")
-                ref_word = ann.get("reference")
-                if status in ("major", "missing") and ref_word:
-                    phrase_parts.append(ref_word)
-                    continue
-                if status not in ("extra", "uncertain") and phrase_parts:
-                    wrong_words.append(" ".join(phrase_parts))
-                    correction_spans.append(
-                        _correction_span_from_annotations(annotations, phrase_start_idx, i - 1)
-                    )
-                    phrase_parts = []
-            if phrase_parts:
-                wrong_words.append(" ".join(phrase_parts))
-                correction_spans.append(
-                    _correction_span_from_annotations(
-                        annotations,
-                        phrase_start_idx,
-                        min(len(annotations) - 1, phrase_start_idx + len(phrase_parts) - 1),
-                    )
-                )
+        wrong_words, correction_spans = _wrong_words_and_spans_from_word_errors(annotations)
 
         if statuses - {"correct", "minor", None}:
             guard_result["verdict"] = "error"
@@ -511,13 +530,14 @@ class RealtimeStreamer:
                     self._surah_detector = SurahDetector(self.ayah_json_path)
                 except Exception as e:
                     print(f"[RealtimeStreamer] Surah detector not available: {e}")
-            try:
-                from hybrid_pipeline import HybridViterbiPipeline
-                lm_path = os.path.join(_BASE_DIR, "quran_5gram.arpa")
-                if os.path.isfile(lm_path):
-                    self._viterbi_pipeline = HybridViterbiPipeline(self.ayah_json_path, lm_path)
-            except Exception as e:
-                print(f"[RealtimeStreamer] Viterbi pipeline not available: {e}")
+            # HybridViterbiPipeline construction moved to _ensure_viterbi_pipeline()
+            # (2026-08-02, Claude/chat, per Hamza's "we don't even use kenlm"
+            # catch) — it was being built here unconditionally (n-gram index
+            # over 6235 ayahs + kenlm LM load) even though its only consumer,
+            # decode_full_session(), is unreachable from the current live flow
+            # (see stop_live_session()'s own comment in app.py: the
+            # full-session re-decode step was already removed). Now built
+            # lazily on first actual call to decode_full_session() instead.
             return
 
         if self._model_type == "wav2vec2":
@@ -633,13 +653,9 @@ class RealtimeStreamer:
                 print(f"[RealtimeStreamer] Surah detector not available: {e}")
 
         # Load viterbi pipeline
-        try:
-            from hybrid_pipeline import HybridViterbiPipeline
-            lm_path = os.path.join(_BASE_DIR, "quran_5gram.arpa")
-            if os.path.isfile(lm_path):
-                self._viterbi_pipeline = HybridViterbiPipeline(self.ayah_json_path, lm_path)
-        except Exception as e:
-            print(f"[RealtimeStreamer] Viterbi pipeline not available: {e}")
+        # HybridViterbiPipeline construction moved to _ensure_viterbi_pipeline()
+        # (2026-08-02, Claude/chat) — see comment in the groq branch above for
+        # why this was unreachable dead weight at model-load time.
 
     def _decode_chunk(self, audio_np: np.ndarray) -> str:
         audio_np = audio_np.astype(np.float32)
@@ -1063,6 +1079,21 @@ class RealtimeStreamer:
             guard_result["corrected_text"] = raw_text
             guard_result["display_text"] = raw_text
 
+        # Word-level error annotations, same computation as Combined Mode's
+        # (see process_chunk_combined) and api/main.py's /transcribe endpoint
+        # — kept here too so Standard Mode chunks get the same word_errors
+        # field, not just Combined Mode ones.
+        ref_text_for_words = guard_result.get("matched_ayah_text") or ""
+        if ref_text_for_words:
+            hyp_for_annotation = correct_text_rules(raw_text, mode="balanced")
+            guard_result["word_errors"] = get_word_error_annotations(
+                hyp_for_annotation,
+                ref_text_for_words,
+                confidence=guard_result.get("confidence"),
+            )
+        else:
+            guard_result["word_errors"] = []
+
         guard_result["surah_lock_state"] = lock_state
         guard_result["_decode_time_s"] = round(decode_time, 3)
         guard_result["_chunk_duration_s"] = round(len(chunk_audio) / SAMPLE_RATE, 2)
@@ -1243,6 +1274,25 @@ class RealtimeStreamer:
             ]
             guard_result["harakaat_error_count"] = harakaat_result.harakaat_error_count
 
+        # 5. Word-level error annotations (correct/minor/major/missing/extra)
+        # against the matched ayah — the same computation api/main.py's
+        # /transcribe endpoint already does for one-shot uploads, now also
+        # attached to the live per-chunk result so the WS client gets
+        # word-level verdicts on every streamed chunk, not just file uploads.
+        # Independent of qari_mode: _apply_qari_word_scoring above (when
+        # qari_mode is on) only keeps the flagged wrong_words/spans, not the
+        # full per-word list, so this is computed fresh regardless.
+        ref_text_for_words = guard_result.get("matched_ayah_text") or ""
+        if ref_text_for_words:
+            hyp_for_annotation = correct_text_rules(raw_text, mode="balanced")
+            guard_result["word_errors"] = get_word_error_annotations(
+                hyp_for_annotation,
+                ref_text_for_words,
+                confidence=guard_result.get("confidence"),
+            )
+        else:
+            guard_result["word_errors"] = []
+
         guard_result["surah_lock_state"] = lock_state
         guard_result["_decode_time_s"] = round(decode_time, 3)
         guard_result["_chunk_duration_s"] = round(chunk_duration, 2)
@@ -1288,12 +1338,190 @@ class RealtimeStreamer:
 
         return result
 
+    def process_chunk_api(
+        self,
+        session: RecitationSession,
+        chunk_audio: np.ndarray,
+        correction_mode: str = "balanced",
+        chunk_start_sample: int = None,
+        chunk_end_sample: int = None,
+        qari_mode: bool = False,
+        api_base_url: str = "http://127.0.0.1:8000",
+        model_choice: str = "groq-whisper-large-v3",
+    ) -> ChunkResult:
+        """Combined Mode via a remote api/main.py server's POST /transcribe,
+        instead of running Groq + the local turbo model in this process
+        (masterplan.md §9 — "Use Remote API for Combined Mode").
+
+        Only ever used for Combined Mode, opt-in via app.py's toggle;
+        Standard Mode (process_chunk(), the local tarteel-ai-based model) is
+        completely unaffected regardless of this toggle.
+
+        api/main.py's /transcribe already runs the FULL pipeline server-side
+        (decode + guard_inference + harakaat detection + word-level
+        annotation) and returns it as one JSON blob, so on success this just
+        maps that JSON onto the exact same guard_result shape
+        process_chunk_combined() builds, then reuses
+        session.register_chunk_result() and
+        self.correction_engine.process_verdict() unchanged — this is why
+        Qari Mode, TTS, and the live display's harakaat highlight all just
+        work here with zero changes: they only ever read that shared shape,
+        never care which pipeline produced it.
+
+        On failure (server unreachable/timeout), degrades to a harmless
+        low-confidence "error"-verdict chunk — same tolerance the rest of
+        the pipeline already has for a garbled/low-confidence chunk (see
+        CorrectionEngine._min_trigger_confidence) — rather than crashing the
+        session or silently falling back to a local Groq/turbo-model path
+        this machine may not even have installed (the whole point of using
+        the remote API is often that it ISN'T installed here).
+
+        Known limitation: unlike process_chunk_combined(), this path does
+        not run local rolling-window surah detection (session._detection_buffer
+        / surah_lock_manager) — the stateless /transcribe endpoint has no
+        equivalent, so each ChunkResult.surah_lock_state here simply carries
+        forward whatever the session's last known lock state was. Auto-surah-
+        detection therefore only works well with this toggle on once a surah
+        is already selected/locked; pure "Auto (Detect)" sessions are better
+        served by local Combined Mode until this gets its own remote
+        surah-detection call.
+        """
+        t0 = time.time()
+
+        chunk_rms = float(np.sqrt(np.mean(chunk_audio.astype(np.float32) ** 2)))
+        chunk_duration = len(chunk_audio) / SAMPLE_RATE
+        if chunk_duration < 1.5 or chunk_rms < _MIN_SPEECH_RMS:
+            print(f"[Chunk-API] Skipped — duration={chunk_duration:.2f}s, RMS={chunk_rms:.4f}")
+            return session.register_chunk_result(
+                chunk_audio,
+                {"corrected_text": "", "verdict": "skipped", "confidence": 0.0,
+                 "raw_asr": "", "_skip_reason": f"rms={chunk_rms:.4f} dur={chunk_duration:.2f}s"},
+                None, None,
+                chunk_start_sample=chunk_start_sample,
+                chunk_end_sample=chunk_end_sample,
+            )
+
+        effective_surah = session.surah
+        expected_ayah = session.current_ayah
+
+        api_result = transcribe_via_api(
+            chunk_audio.astype(np.float32),
+            SAMPLE_RATE,
+            surah=effective_surah,
+            expected_ayah=expected_ayah,
+            correction_mode=correction_mode,
+            asr_engine="combined",
+            model_choice=model_choice,
+            api_base_url=api_base_url,
+        )
+        decode_time = time.time() - t0
+
+        if api_result is None:
+            guard_result = {
+                "raw_asr": "", "corrected_text": "", "display_text": "",
+                "matched_ayah": None, "matched_key": None, "matched_ayah_text": None,
+                "cer": None, "wer": None, "coverage": None,
+                "confidence": 0.0, "confidence_level": "low", "verdict": "error",
+                "harakaat_errors": [], "harakaat_error_count": 0, "word_errors": [],
+                "wrong_words": [], "correction_spans": [],
+            }
+        else:
+            matched_ayah = api_result.get("matched_ayah")
+            matched_key = (effective_surah, matched_ayah) if (effective_surah and matched_ayah) else None
+            word_errors = api_result.get("word_errors") or []
+            wrong_words, correction_spans = _wrong_words_and_spans_from_word_errors(word_errors)
+            guard_result = {
+                "raw_asr": api_result.get("raw_asr", ""),
+                "corrected_text": api_result.get("corrected_text", ""),
+                "display_text": api_result.get("corrected_text", ""),
+                "matched_ayah": matched_ayah,
+                "matched_key": matched_key,
+                "matched_ayah_text": api_result.get("matched_ayah_text"),
+                "cer": api_result.get("cer"),
+                "wer": api_result.get("wer"),
+                "coverage": None,
+                "confidence": api_result.get("confidence"),
+                "confidence_level": api_result.get("confidence_level"),
+                "verdict": api_result.get("verdict", "unknown"),
+                "harakaat_errors": api_result.get("harakaat_errors") or [],
+                "harakaat_error_count": api_result.get("harakaat_error_count", 0),
+                "word_errors": word_errors,
+                "wrong_words": wrong_words,
+                "correction_spans": correction_spans,
+            }
+
+        guard_result["surah_lock_state"] = getattr(session, "surah_lock_state", None)
+        guard_result["_decode_time_s"] = round(decode_time, 3)
+        guard_result["_chunk_duration_s"] = round(chunk_duration, 2)
+
+        lock_state = getattr(session, "surah_lock_state", None)
+        result = session.register_chunk_result(
+            chunk_audio, guard_result, None, lock_state,
+            chunk_start_sample=chunk_start_sample,
+            chunk_end_sample=chunk_end_sample,
+        )
+
+        print(
+            f"[Chunk-API {result.chunk_index}] "
+            f"decode={decode_time:.2f}s | "
+            f"raw='{guard_result.get('raw_asr','')[:50]}' | "
+            f"verdict={result.verdict} | "
+            f"harakaat_errors={guard_result.get('harakaat_error_count', 0)} | "
+            f"surah={effective_surah} | api_ok={api_result is not None}"
+        )
+
+        if qari_mode:
+            correction_result = self.correction_engine.process_verdict(
+                verdict=guard_result.get("verdict", "unknown"),
+                raw_asr=guard_result.get("raw_asr", ""),
+                correct_ayah_text=guard_result.get("matched_ayah_text", ""),
+                ayah_num=guard_result.get("matched_ayah"),
+                surah_num=effective_surah,
+                wrong_words=guard_result.get("wrong_words", []),
+                correction_spans=guard_result.get("correction_spans", []),
+                confidence=float(guard_result.get("confidence") or 1.0),
+                harakaat_errors=guard_result.get("harakaat_errors"),
+            )
+            self._last_qari_action = correction_result
+            if correction_result["action"] == "pause":
+                self._vad_paused = True
+            elif correction_result["action"] in ("continue", "skip"):
+                self._vad_paused = False
+        else:
+            self._vad_paused = False
+
+        return result
+
+    def _ensure_viterbi_pipeline(self) -> None:
+        """Lazily build self._viterbi_pipeline on first actual use.
+
+        Only decode_full_session() calls this. Moved out of
+        _ensure_model_loaded() (2026-08-02, Claude/chat, per Hamza) because
+        it was building a HybridViterbiPipeline — n-gram index over 6235
+        ayahs plus a KenLM LM load — unconditionally at model-load time,
+        even though decode_full_session() is currently unreachable from both
+        the desktop live flow (app.py's stop_live_session() deliberately
+        removed the full-session re-decode step) and the API (api/main.py
+        never calls it either). Kept, not deleted, in case a
+        full-session-compare feature gets rewired to call it later.
+        """
+        if self._viterbi_pipeline is not None:
+            return
+        try:
+            from hybrid_pipeline import HybridViterbiPipeline
+            lm_path = os.path.join(_BASE_DIR, "quran_5gram.arpa")
+            if os.path.isfile(lm_path):
+                self._viterbi_pipeline = HybridViterbiPipeline(self.ayah_json_path, lm_path)
+        except Exception as e:
+            print(f"[RealtimeStreamer] Viterbi pipeline not available: {e}")
+
     def decode_full_session(
         self,
         session: RecitationSession,
         correction_mode: str = "balanced",
     ) -> Dict[str, Any]:
         """Re-decode the full session audio as one piece for comparison."""
+        self._ensure_viterbi_pipeline()
         full_audio = session.get_full_session_audio()
         if len(full_audio) == 0:
             return {"raw_asr": "", "guard_result": {}, "viterbi_result": {}, "eval_result": {}}

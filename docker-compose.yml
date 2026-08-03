@@ -1,0 +1,49 @@
+services:
+  hafizify-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hafizify-server
+    ports:
+      - "8000:8000"
+    environment:
+      # From the real .env.example -- GROQ_API_KEY required for Combined Mode
+      # (groq_transcriber.py). HF_TOKEN optional but avoids rate-limiting on
+      # the "check for updates" metadata calls hybrid_diacritic_pipeline.py
+      # makes on startup when fetching whisper-l-v3-turbo-quran-lora-dataset-mix
+      # (the 1.6GB model itself is cached after first run either way).
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - HF_TOKEN=${HF_TOKEN}
+    env_file:
+      - .env
+    volumes:
+      # Mount the big model dir instead of baking it into the image for
+      # faster rebuilds during development. Switch to COPY in the Dockerfile
+      # for a single self-contained deploy image later.
+      - ./whisper-l-v3-turbo-quran-lora-dataset-mix:/app/whisper-l-v3-turbo-quran-lora-dataset-mix:ro
+    # GPU reservation removed (2026-08-02, Claude/chat) -- this host's
+    # `python app.py` run already showed `device=cpu` (torch.cuda.is_available()
+    # is False there too), and requesting a GPU here failed at container
+    # start with "WSL environment detected but no adapters were found" --
+    # i.e. no NVIDIA GPU is actually reachable from WSL2 on this machine
+    # right now, driver or hardware. realtime_streamer.py already falls back
+    # to CPU cleanly (self.device = "cuda" if torch.cuda.is_available() else
+    # "cpu"), so the container runs the exact same way the desktop app
+    # already does -- this isn't a workaround, it's matching reality.
+    # To re-enable once a GPU is actually available (confirm first with
+    # `nvidia-smi` in a plain Windows terminal, and Docker Desktop's
+    # Settings > Resources > WSL Integration has GPU support on), restore:
+    #   deploy:
+    #     resources:
+    #       reservations:
+    #         devices:
+    #           - driver: nvidia
+    #             count: 1
+    #             capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 30s   # give the turbo model time to load on cold start
