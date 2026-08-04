@@ -1,6 +1,14 @@
 # syntax=docker/dockerfile:1
 # Hafizify API server -- runs api/main.py via uvicorn only (no Gradio UI).
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# AMD/ROCm build (2026-08-05, Claude/chat) -- swapped from the CUDA base
+# image. rocm/pytorch:latest already ships torch built against ROCm, so we
+# no longer pip-install torch/torchvision/torchaudio from a CUDA wheel
+# index below -- just requirements-server.txt on top of what's already
+# there. KNOWN RISK: ctranslate2 (used for both CT2 models --
+# whisper-base-quran-lora-ct2 and any future turbo CT2 conversion) has no
+# reliable official ROCm wheel as of this writing -- that code path may
+# fail on AMD regardless of everything else here working.
+FROM rocm/pytorch:latest
 
 # --- System deps ---
 # libsndfile1: required by the `soundfile` package (audio I/O) at runtime.
@@ -55,7 +63,6 @@ COPY requirements-server.txt .
 # of any image layer), so there's no image-size tradeoff for removing it.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip && \
-    pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 && \
     pip install -r requirements-server.txt
 
 # --- App code -- only what api/main.py's import chain actually needs ---
@@ -66,6 +73,13 @@ COPY realtime_streamer.py session_manager.py hybrid_diacritic_pipeline.py \
      api_client.py \
      quran_trie_cache.pkl quran_lm.txt quran_5gram.arpa ./
 COPY fyp_model/ ./fyp_model/
+
+# whisper-base-quran-lora-ct2/ (Standard Mode) deliberately NOT copied into
+# this AMD/ROCm deploy image (2026-08-05, Claude/chat) -- this server only
+# runs Combined Mode here, and ctranslate2 (what Standard Mode needs to
+# load this model) has no reliable ROCm support anyway. If Standard Mode
+# is ever needed on this deploy target, re-add:
+#   COPY whisper-base-quran-lora-ct2/ ./whisper-base-quran-lora-ct2/
 
 # --- Model weights ---
 # Left OUT of the image deliberately -- docker-compose.yml mounts this dir

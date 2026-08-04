@@ -29,25 +29,27 @@ services:
       # fine after downloading). This named volume makes that download
       # happen once, ever.
       - hf_cache:/root/.cache/huggingface
-    # GPU reservation removed (2026-08-02, Claude/chat) -- this host's
-    # `python app.py` run already showed `device=cpu` (torch.cuda.is_available()
-    # is False there too), and requesting a GPU here failed at container
-    # start with "WSL environment detected but no adapters were found" --
-    # i.e. no NVIDIA GPU is actually reachable from WSL2 on this machine
-    # right now, driver or hardware. realtime_streamer.py already falls back
-    # to CPU cleanly (self.device = "cuda" if torch.cuda.is_available() else
-    # "cpu"), so the container runs the exact same way the desktop app
-    # already does -- this isn't a workaround, it's matching reality.
-    # To re-enable once a GPU is actually available (confirm first with
-    # `nvidia-smi` in a plain Windows terminal, and Docker Desktop's
-    # Settings > Resources > WSL Integration has GPU support on), restore:
-    #   deploy:
-    #     resources:
-    #       reservations:
-    #         devices:
-    #           - driver: nvidia
-    #             count: 1
-    #             capabilities: [gpu]
+    # GPU passthrough for AMD/ROCm (2026-08-05, Claude/chat) -- swapped from
+    # the NVIDIA `deploy.resources.reservations` block. ROCm doesn't use
+    # Docker's device-reservation/driver-capabilities mechanism at all;
+    # instead the container needs direct access to the host's DRM/KFD
+    # device nodes plus membership in the host's `video` group. Requires
+    # the ROCm kernel driver (amdgpu) already installed on the HOST, not
+    # just inside the container -- confirm with `rocm-smi` on the host
+    # first. `video` (and on some distros `render`) must be added via
+    # `group_add` or the container can open the device nodes but still get
+    # permission-denied talking to them.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+    # Docker's default /dev/shm is 64MB -- too small for PyTorch/ROCm's
+    # shared-memory IPC under real model load (torch's DataLoader workers
+    # and some ROCm collective ops use it), and failures here show up as
+    # confusing crashes unrelated to the actual code. 16g is generous
+    # headroom given the MI300X host has 240GB system RAM to spare.
+    shm_size: '16gb'
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
