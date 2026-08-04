@@ -9,7 +9,14 @@ or separately.
 
 Run from the `hafizify/` project root (same venv as the desktop app):
 
-    uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload --ws-ping-interval 20 --ws-ping-timeout 60
+
+(--ws-ping-interval/--ws-ping-timeout: extra headroom above uvicorn's
+20s/20s defaults so a slow moment -- network hiccup, cold model load --
+doesn't trip the keepalive watchdog and tear down a live session. The WS
+handler already offloads chunk decoding to a worker thread via
+asyncio.to_thread so the event loop stays responsive to pings during
+normal decode time; this is just a safety margin on top of that.)
 
 Two capabilities:
   1. POST /transcribe        - stateless file-upload transcription
@@ -32,6 +39,7 @@ as the model's own thread-safety requirement on desktop).
 """
 import os
 import sys
+import asyncio
 import tempfile
 import threading
 import uuid
@@ -412,9 +420,31 @@ def _process_one_chunk(session: RecitationSession, chunk_audio, start: int, end:
     )
 
 
-def _finalize_active_session() -> Optional[Dict[str, Any]]:
+def _process_one_chunk_locked(session: RecitationSession, chunk_audio, start: int, end: int):
+    """Same as _process_one_chunk(), but also holds _INFERENCE_LOCK for the
+    duration of the call. Runs on a worker thread via asyncio.to_thread() —
+    see the WS loop below — so the plain (non-async, no internal await)
+    decode work in _process_one_chunk() (Groq HTTP call + local CPU model
+    forward pass, tens of seconds in Combined Mode) never blocks the
+    asyncio event loop. Without this, the event loop can't service
+    WebSocket ping/pong keepalives while a chunk decodes, and uvicorn kills
+    the connection with 1011 'keepalive ping timeout' partway through every
+    slow chunk."""
+    with _INFERENCE_LOCK:
+        return _process_one_chunk(session, chunk_audio, start, end)
+
+
+def _finalize_active_session_sync() -> Optional[Dict[str, Any]]:
     """Flush + finalize whatever the active session is, and release the lock.
-    Returns the summary JSON, or None if there was no active session."""
+    Returns the summary JSON, or None if there was no active session.
+
+    Synchronous — call directly from a non-async context (e.g. the sync
+    /session/{id}/stop endpoint, which FastAPI already runs in its own
+    thread pool). From inside an async function, use
+    _finalize_active_session() instead, which offloads this to a worker
+    thread so the flush's chunk decodes don't block the event loop the
+    same way a raw call here would (see _process_one_chunk_locked).
+    """
     global _active_session
 
     with _SESSION_LOCK:
@@ -433,11 +463,19 @@ def _finalize_active_session() -> Optional[Dict[str, Any]]:
         return summary
 
 
+async def _finalize_active_session() -> Optional[Dict[str, Any]]:
+    """Async wrapper around _finalize_active_session_sync() — runs the
+    flush/finalize work on a worker thread via asyncio.to_thread() so it
+    never blocks the event loop when called from the WebSocket handler
+    (same reasoning as _process_one_chunk_locked)."""
+    return await asyncio.to_thread(_finalize_active_session_sync)
+
+
 @app.post("/session/{session_id}/stop")
 def stop_session(session_id: str):
     if _active_session is None or _active_session.session_id != session_id:
         raise HTTPException(status_code=404, detail="No active session with that id.")
-    summary = _finalize_active_session()
+    summary = _finalize_active_session_sync()
     return summary
 
 
@@ -497,8 +535,7 @@ async def stream_session(websocket: WebSocket, session_id: str):
             ready_chunks = session.feed_audio(audio_fragment)
 
             for chunk_audio, start, end in ready_chunks:
-                with _INFERENCE_LOCK:
-                    result = _process_one_chunk(session, chunk_audio, start, end)
+                result = await asyncio.to_thread(_process_one_chunk_locked, session, chunk_audio, start, end)
                 await websocket.send_json(chunk_result_to_json(result, session))
 
                 if _active_session_qari_mode:
@@ -529,7 +566,7 @@ async def stream_session(websocket: WebSocket, session_id: str):
                         if action_json:
                             await websocket.send_json(action_json)
 
-        summary = _finalize_active_session()
+        summary = await _finalize_active_session()
         if summary:
             await websocket.send_json(summary)
         await websocket.close()
@@ -538,13 +575,13 @@ async def stream_session(websocket: WebSocket, session_id: str):
         # Client dropped without sending "stop" (e.g. call ended, app
         # backgrounded). Finalize server-side so the session lock isn't
         # left stuck forever.
-        _finalize_active_session()
+        await _finalize_active_session()
 
     except Exception as exc:
         try:
             await websocket.send_json(error_to_json(str(exc)))
         finally:
-            _finalize_active_session()
+            await _finalize_active_session()
             await websocket.close()
 
 

@@ -63,6 +63,7 @@ COPY api/ ./api/
 COPY realtime_streamer.py session_manager.py hybrid_diacritic_pipeline.py \
      harakaat_error_detector.py surah_detector.py correction_engine.py \
      groq_transcriber.py quran_audio_provider.py quran_trie.py \
+     api_client.py \
      quran_trie_cache.pkl quran_lm.txt quran_5gram.arpa ./
 COPY fyp_model/ ./fyp_model/
 
@@ -78,4 +79,11 @@ EXPOSE 8000
 HEALTHCHECK --interval=15s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# --ws-ping-interval/--ws-ping-timeout widened from uvicorn's defaults
+# (20s/20s) to 20s/60s. The WS handler now offloads chunk decoding to a
+# worker thread (asyncio.to_thread) so the event loop stays responsive to
+# pings during normal operation -- this is just extra headroom for a
+# genuinely slow moment (network hiccup, GPU cold-start, etc.) so a single
+# delayed pong doesn't tear down and reconnect a live recitation session.
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--ws-ping-interval", "20", "--ws-ping-timeout", "60"]
