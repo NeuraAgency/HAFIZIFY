@@ -54,6 +54,21 @@ class CorrectionEngine:
 
         self._pending_wrong_words = []
         self._pending_corrections = []
+        # Which kind of correction is currently pending: "word" (consonant/
+        # missing/extra word mistake — the original flow) or "harakaat"
+        # (vowel-only mistake — masterplan.md §10). Determines how
+        # _handle_verifying() checks whether the reciter actually fixed it:
+        # word corrections check consonant-level text match; harakaat
+        # corrections must check fresh diacritics, since a text match alone
+        # would pass on the very first retry (the consonants were already
+        # right — that's what made it a harakaat error and not a word one).
+        self._correction_kind = "word"
+        # Normalized (diacritic-stripped) reference words currently pending
+        # a harakaat fix. Deliberately NOT touched by consume_pending_match()
+        # (which only reads/writes _pending_wrong_words) — kept as an
+        # independent set so the two verification paths can't interfere with
+        # each other even though both may be "pending" in some form.
+        self._pending_harakaat_ref_words: set = set()
         self._state_lock = threading.RLock()
         self._correction_id = 0
         
@@ -151,7 +166,7 @@ class CorrectionEngine:
             elif self.state == "VERIFYING":
                 return self._handle_verifying(
                     verdict, raw_asr, correct_ayah_text, wrong_words,
-                    confidence=confidence,
+                    confidence=confidence, harakaat_errors=harakaat_errors,
                 )
             
             return {"action": "continue", "state": self.state}
@@ -170,14 +185,14 @@ class CorrectionEngine:
         if verdict == "ok":
             self.total_ok += 1
             if harakaat_errors:
-                return self._handle_harakaat_hint(harakaat_errors)
+                return self._handle_harakaat_error(harakaat_errors)
             self._notify("LISTENING")
             return {"action": "continue", "state": "LISTENING"}
 
         elif verdict == "minor":
             self.total_minor += 1
             if harakaat_errors:
-                return self._handle_harakaat_hint(harakaat_errors)
+                return self._handle_harakaat_error(harakaat_errors)
             self._notify("LISTENING")
             return {"action": "warn", "state": "LISTENING",
                     "message": "تحسين بسيط مطلوب"}
@@ -195,6 +210,7 @@ class CorrectionEngine:
             self._correction_id += 1
             correction_id = self._correction_id
             self.state = "CORRECTING"
+            self._correction_kind = "word"
             self._notify("CORRECTING")
 
             self._pending_corrections = self._build_pending_corrections(
@@ -224,13 +240,19 @@ class CorrectionEngine:
                     "message": "خطأ — صحح الكلمة"}
 
     # ─── VERIFYING state ───────────────────────────────────
-    def _handle_verifying(self, verdict, raw_asr, correct_ayah_text, wrong_words, confidence: float = 1.0) -> dict:
+    def _handle_verifying(
+        self, verdict, raw_asr, correct_ayah_text, wrong_words,
+        confidence: float = 1.0, harakaat_errors: list | None = None,
+    ) -> dict:
         # Ignore low-confidence/garbled chunks (background noise, ASR
         # hallucinations on silence, etc.) — they aren't a real correction
         # attempt, so don't count them as "still wrong" and don't replay TTS.
         if confidence < self._min_trigger_confidence:
             return {"action": "continue", "state": "VERIFYING",
                     "message": "بانتظار المحاولة"}
+
+        if self._correction_kind == "harakaat":
+            return self._handle_verifying_harakaat(verdict, harakaat_errors)
 
         if verdict in ("ok", "minor"):
             self.total_ok += 1
@@ -274,28 +296,148 @@ class CorrectionEngine:
                 "attempts": self.correction_attempts,
                 "message": "حاول مرة أخرى"}
 
-    # ─── HARAKAAT_HINT (masterplan.md §4.4 / Phase 5) ─────
-    def _handle_harakaat_hint(self, harakaat_errors: list) -> dict:
-        """Lightweight sibling reaction to vowel-only (harakaat) mistakes —
-        Combined Mode only. Does NOT use the strict consecutive-error gate
-        that CORRECTING/VERIFYING use for word (makhraj) errors: a single
-        vowel slip is a review note, not a stop-and-retry event. Plays a
-        short, distinct audio cue (different from the full ayah correction
-        TTS/audio) and returns to LISTENING immediately — no multi-attempt
-        verification loop."""
-        self._notify("HARAKAAT_HINT")
-        threading.Thread(
-            target=self.speak,
-            args=("انتبه للتشكيل",),
-            daemon=True,
-        ).start()
-        self._notify("LISTENING")
-        return {
-            "action": "hint",
-            "state": "LISTENING",
-            "message": "انتبه للتشكيل",
-            "harakaat_errors": harakaat_errors,
+    def _handle_verifying_harakaat(self, verdict, harakaat_errors: list | None) -> dict:
+        """Verification for a pending harakaat (vowel-only) correction.
+
+        Deliberately does NOT reuse consume_pending_match()/the word-level
+        text check above — that check runs after normalize_arabic(), which
+        strips all diacritics, so it would report "fixed" the instant the
+        reciter says the same consonants again regardless of whether the
+        vowel is now right (it already was consonant-correct before this
+        correction even started — that's what made it a harakaat error
+        rather than a word error). Instead this compares the FRESH
+        harakaat_errors computed for this new chunk (by
+        harakaat_error_detector, re-run on every chunk regardless of qari
+        state) against the specific reference word(s) this correction is
+        for. A word only counts as fixed when it no longer shows up as a
+        harakaat_error at all in this chunk.
+        """
+        current_norm_words = {
+            normalize_arabic(h.get("reference") or h.get("predicted") or "")
+            for h in (harakaat_errors or [])
+            if (h.get("reference") or h.get("predicted"))
         }
+        still_wrong = self._pending_harakaat_ref_words & current_norm_words
+
+        if not still_wrong:
+            self.total_ok += 1
+            if self.error_history:
+                self.error_history[-1]["resolved"] = True
+                self.error_history[-1]["attempts"] = self.correction_attempts
+
+            self._correction_id += 1
+            self.correction_attempts = 0
+            self._pending_wrong_words = []
+            self._pending_corrections = []
+            self._pending_harakaat_ref_words = set()
+            self._correction_kind = "word"
+            self.state = "LISTENING"
+            self._notify("LISTENING")
+
+            threading.Thread(target=self.speak, args=("أحسنت",), daemon=True).start()
+
+            return {"action": "continue", "state": "LISTENING",
+                    "message": "أحسنت — تابع"}
+
+        # Still wrong — replay the correction for whichever flagged word(s)
+        # remain wrong (a multi-word harakaat correction can be partially
+        # fixed; only replay the ones still pending).
+        self.correction_attempts += 1
+        if self.error_history:
+            self.error_history[-1]["attempts"] = self.correction_attempts
+
+        self._pending_corrections = [
+            c for c in self._pending_corrections
+            if normalize_arabic(c.get("text", "")) in still_wrong
+        ]
+
+        self._correction_id += 1
+        correction_id = self._correction_id
+        self.state = "CORRECTING"
+        self._notify("CORRECTING")
+        threading.Thread(
+            target=self._speak_words_and_verify,
+            args=(list(self._pending_corrections), correction_id),
+            daemon=True
+        ).start()
+
+        return {"action": "retry", "state": "CORRECTING",
+                "attempts": self.correction_attempts,
+                "message": "حاول التشكيل مرة أخرى"}
+
+    # ─── Harakaat correction (masterplan.md §10) ───────────
+    def _handle_harakaat_error(self, harakaat_errors: list) -> dict:
+        """Full CORRECTING/VERIFYING interrupt for a vowel-only (harakaat)
+        mistake — Combined Mode only. Uses the same audio-correction flow
+        as a word/consonant error (mic pauses, the correct ayah audio plays,
+        then it waits for a verified fix before resuming) rather than the
+        old lighter HARAKAAT_HINT sub-state this replaces: per Hamza, a
+        harakaat mistake should be corrected and verified, not just noted.
+
+        Plays the real Quran recitation audio for the specific flagged
+        word(s) (via _play_quran_correction, same as the word-error path) —
+        that audio inherently carries the correct diacritics/pronunciation,
+        which is a better teaching signal here than synthesized TTS would
+        be. Uses each flagged word's ref_index (position in the REFERENCE
+        ayah, not the predicted text — see WordAnnotation.ref_index in
+        harakaat_error_detector.py) to select the right audio segment.
+        """
+        self.correction_attempts = 0
+        self._correction_id += 1
+        correction_id = self._correction_id
+        self.state = "CORRECTING"
+        self._correction_kind = "harakaat"
+        self._notify("CORRECTING")
+
+        corrections = []
+        for h in harakaat_errors:
+            ref_word = h.get("reference") or h.get("predicted")
+            if not ref_word:
+                continue
+            ref_idx = h.get("ref_index")
+            corrections.append({
+                "text": ref_word,
+                "surah": self.current_surah,
+                "ayah": self.current_ayah,
+                "ref_word_start": ref_idx,
+                "ref_word_end": ref_idx,
+            })
+        self._pending_corrections = corrections
+        self._pending_wrong_words = [c["text"] for c in corrections]
+        self._pending_harakaat_ref_words = {normalize_arabic(c["text"]) for c in corrections}
+
+        self.error_history.append({
+            "ayah": self.current_ayah,
+            "surah": self.current_surah,
+            "wrong_text": "",
+            "correct_text": "",
+            "wrong_words": list(self._pending_wrong_words),
+            "attempts": 0,
+            "resolved": False,
+            "skipped": False,
+            "kind": "harakaat",
+        })
+
+        threading.Thread(
+            target=self._speak_words_and_verify,
+            args=(list(self._pending_corrections), correction_id),
+            daemon=True
+        ).start()
+
+        return {"action": "pause", "state": "CORRECTING",
+                "message": "خطأ في التشكيل — استمع وأعد",
+                "harakaat_errors": harakaat_errors}
+
+    def is_harakaat_correction(self) -> bool:
+        """True while CORRECTING/VERIFYING is for a harakaat (vowel-only)
+        mistake rather than a word/consonant one. realtime_streamer.py's
+        process_chunk_combined() checks this during VERIFYING to decide
+        whether to take its normal diacritic-blind consume_pending_match()
+        shortcut (wrong for harakaat verification — see
+        _handle_verifying_harakaat's docstring) or run the full word/
+        harakaat scoring path so fresh diacritics are actually computed for
+        this handler to check."""
+        return self._correction_kind == "harakaat"
 
     # ─── Helpers ───────────────────────────────────────────
     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):

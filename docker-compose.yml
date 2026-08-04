@@ -10,8 +10,7 @@ services:
       # From the real .env.example -- GROQ_API_KEY required for Combined Mode
       # (groq_transcriber.py). HF_TOKEN optional but avoids rate-limiting on
       # the "check for updates" metadata calls hybrid_diacritic_pipeline.py
-      # makes on startup when fetching whisper-l-v3-turbo-quran-lora-dataset-mix
-      # (the 1.6GB model itself is cached after first run either way).
+      # makes on startup when fetching whisper-l-v3-turbo-quran-lora-dataset-mix.
       - GROQ_API_KEY=${GROQ_API_KEY}
       - HF_TOKEN=${HF_TOKEN}
     env_file:
@@ -21,6 +20,15 @@ services:
       # faster rebuilds during development. Switch to COPY in the Dockerfile
       # for a single self-contained deploy image later.
       - ./whisper-l-v3-turbo-quran-lora-dataset-mix:/app/whisper-l-v3-turbo-quran-lora-dataset-mix:ro
+      # Persist the HF Hub cache (2026-08-04, Claude/chat) -- without this,
+      # the container filesystem is thrown away on every restart/recreate,
+      # so "[Combined Mode] Not found in local HF cache ... downloading from
+      # HuggingFace Hub" was firing on EVERY docker compose up, re-pulling
+      # the whole MaddoggProduction/whisper-l-v3-turbo-quran-lora-dataset-mix
+      # repo from HF each time (harmless, just slow -- it does still load
+      # fine after downloading). This named volume makes that download
+      # happen once, ever.
+      - hf_cache:/root/.cache/huggingface
     # GPU reservation removed (2026-08-02, Claude/chat) -- this host's
     # `python app.py` run already showed `device=cpu` (torch.cuda.is_available()
     # is False there too), and requesting a GPU here failed at container
@@ -47,3 +55,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 30s   # give the turbo model time to load on cold start
+
+volumes:
+  hf_cache:

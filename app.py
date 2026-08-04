@@ -603,9 +603,57 @@ def start_live_session(
     qari_mode=False,
     asr_engine="Standard (offline, fast)",
     use_api_combined=False,
+    api_base_url="http://127.0.0.1:8000",
 ):
     """Initialize a new recording session when user clicks Start."""
     global _active_session, _worker_thread, _display_formatter
+
+    # API reachability check (added 2026-08-04, Claude/chat) -- only relevant
+    # when Combined Mode via the remote API is selected (the "Active Tajweed
+    # Detection" checkbox). Standard Mode and local Combined Mode never touch
+    # api_base_url at all, so this is skipped entirely for them rather than
+    # requiring a server those modes don't need.
+    #
+    # Without this, a dead/misconfigured API URL was only discoverable after
+    # tapping Record and waiting for the first chunk's httpx call to time out
+    # or fail silently inside process_chunk_api() -- which could take up to
+    # api_client.py's full 120s timeout before anything visible happened.
+    # Checking /health here (a few-second call, not a full chunk decode)
+    # catches "server isn't running" / "wrong URL" / "ngrok tunnel died"
+    # immediately, before the reciter ever starts talking into a dead pipe.
+    if _parse_asr_engine(asr_engine) == "combined" and use_api_combined:
+        import httpx
+        placeholder_html = LiveDisplayFormatter._placeholder_html("Start reciting...")
+        empty_panel = LiveDisplayFormatter._error_panel_html(0, 0, 0, 0, 0, 0.0)
+        table_header = "<div class='chunk-table'>No chunks yet.</div>"
+        badge_html = _format_surah_badge(None)
+        try:
+            resp = httpx.get(f"{api_base_url.rstrip('/')}/health", timeout=5.0)
+            resp.raise_for_status()
+            print(f"[Hafizify] API health check OK ({api_base_url}): {resp.json()}")
+        except Exception as e:
+            print(f"[Hafizify] API health check FAILED ({api_base_url}): {e!r}")
+            error_status = f"\U0001F534 Cannot reach Tajweed API at {api_base_url} — {e}"
+            # surah_progress_display is the only one of these 8 outputs that
+            # isn't visible=False in the current UI layout -- live_status,
+            # live_merged_display, and error_panel are all hidden, so an
+            # error written only to `status` would silently vanish. Render
+            # it into that slot instead so the reciter actually sees it
+            # before ever tapping Record.
+            error_html = (
+                "<div style='padding:14px; border-radius:12px; "
+                "background:rgba(216,90,105,0.10); border:1px solid rgba(216,90,105,0.4); "
+                "color:#f3d7da; font-size:0.95em; line-height:1.5;'>"
+                f"<b>\U0001F534 Cannot reach Tajweed API</b><br>"
+                f"URL: {api_base_url}<br>"
+                f"Error: {e}<br><br>"
+                "Check that the server is running (<code>docker compose up</code> / "
+                "<code>docker ps</code>) and the API Base URL field above matches its "
+                "actual address (an ngrok URL may have rotated). Or turn off "
+                "'Active Tajweed Detection' to use the local offline model instead."
+                "</div>"
+            )
+            return error_status, placeholder_html, error_html, empty_panel, "", "", table_header, badge_html
 
     # Reset Correction Engine state for new session
     if qari_mode:
@@ -672,8 +720,7 @@ def start_live_session(
             "",
         )
     
-    correction_html = _format_correction_status("LISTENING") if qari_mode else ""
-    return status, placeholder_html, progress_html, empty_panel, "", "", table_header, "", badge_html, correction_html
+    return status, placeholder_html, progress_html, empty_panel, "", "", table_header, badge_html
 
 
 def _surah_name(surah_num):
@@ -725,24 +772,6 @@ def _format_surah_candidates(candidates) -> str:
     for cand in candidates[:3]:
         parts.append(f"{_surah_name(cand.surah)} ({cand.score:.2f})")
     return "; ".join(parts)
-
-
-def _format_correction_status(state: str) -> str:
-    if state == "LISTENING":
-        color = "#10b981"  # green
-    elif state == "CORRECTING":
-        color = "#ef4444"  # red
-    elif state == "VERIFYING":
-        color = "#f59e0b"  # yellow
-    else:
-        color = "#64748b"  # gray
-
-    return (
-        f"<div style='padding:8px 16px; border-radius:8px; text-align:center; font-weight:bold; "
-        f"background-color:rgba({LiveDisplayFormatter._hex_to_rgb(color)},0.2); color:{color}; "
-        f"border: 1px solid {color}; margin-top:10px;'>"
-        f"QARI MODE: {state}</div>"
-    )
 
 
 def _build_expected_ayah_html(session, formatter, qari_mode: bool) -> str:
@@ -806,7 +835,7 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, 
     """
     global _active_session, _display_formatter
 
-    no_update = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+    no_update = (gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
     with _session_lock:
         session_ref = _active_session
         formatter_ref = _display_formatter
@@ -830,10 +859,9 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, 
         session_ref._cumulative_offset = estimated_16k_len
         session_ref._last_fed_samples = estimated_16k_len
         session_ref.skip_paused_audio()
-        correction_state = rt_streamer.correction_engine.state
         return (
             gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
-            gr.update(), gr.update(), gr.update(), _format_correction_status(correction_state)
+            gr.update(), gr.update(), gr.update(),
         )
 
     sr, audio_np = audio_data
@@ -960,10 +988,7 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, 
         guessed_surah_text = _format_surah_guess(lock_state, detected_surah)
         badge_html = _format_surah_badge(lock_state)
 
-    correction_state = rt_streamer.correction_engine.state if qari_mode else "INACTIVE"
-    correction_html = _format_correction_status(correction_state) if qari_mode else ""
-
-    return expected_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed_surah_text, badge_html, correction_html
+    return expected_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed_surah_text, badge_html
 
 
 def _build_chunks_table(session):
@@ -1065,14 +1090,13 @@ def _build_live_ui_snapshot(session):
 
 
 def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="http://127.0.0.1:8000"):
-    """Drain the queue (yielding updates), then return all 13 UI outputs with full results."""
+    """Drain the queue (yielding updates), then return all 9 UI outputs with full results."""
     global _active_session
 
-    # 13 outputs: live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
-    #             corrected_box, chunks_table_md, comparison_md,
-    #             session_eval_json, guessed_surah_box, surah_badge_html, session_wav, correction_status
+    # 9 outputs: live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
+    #            corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html
     if _active_session is None:
-        yield ("No active session.", "", "", "", "", "", "", "", {}, "", "", None, "")
+        yield ("No active session.", "", "", "", "", "", "", "", "")
         return
 
     with _session_lock:
@@ -1099,7 +1123,7 @@ def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=F
             yield (
                 f"🔴 Stopping... finishing {int(_chunk_queue.unfinished_tasks)} remaining chunk(s)...",
                 merged_html, progress_html, error_html, all_raw, all_corrected,
-                chunks_table, "", {}, guessed, badge_html, None, ""
+                chunks_table, guessed, badge_html
             )
             time.sleep(1.0)
 
@@ -1109,20 +1133,13 @@ def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=F
         yield (
             "🔴 Finalizing session...",
             merged_html, progress_html, error_html, all_raw, all_corrected,
-            chunks_table, "", {}, guessed, badge_html, None, ""
+            chunks_table, guessed, badge_html
         )
 
         # ---- 4. Finalize (saves WAVs + JSON) ----
         results_path = session.finalize()
 
         # ---- 5. Build session summary from chunk-by-chunk results only ----
-        # (Removed the full-session re-decode/"compare" step — re-decoding the
-        # entire session's audio from scratch on CPU as one blob was taking
-        # ~1 minute and crashing after Stop was pressed. The chunk-by-chunk
-        # merged transcript already covers everything needed; this just
-        # drops the redundant second decode pass.)
-        chunk_merged = session.get_merged_transcript()
-
         detected_surah = session.get_detected_surah()
         lock_state = getattr(session, "surah_lock_state", None)
         if getattr(session, "surah_detection_enabled", True) is False:
@@ -1132,38 +1149,21 @@ def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=F
             guessed_surah_name = _format_surah_guess(lock_state, detected_surah)
             badge_html = _format_surah_badge(lock_state)
 
-        comparison = f"""## 📊 Session Summary
-
-### Chunk-by-Chunk Merged Transcript
-> {chunk_merged or '(no chunks processed)'}
-
----
-
-### Session Stats
-- **Total Duration:** {session.total_duration_s:.1f}s
-- **Chunks Processed:** {len(session.chunk_results)}
-- **Guessed Surah:** {guessed_surah_name}
-- **Session ID:** {session.session_id}
-"""
-
-        eval_report = {}
-
         status = (
             f"🔴 Session ended — {len(session.chunk_results)} chunks, "
             f"{session.total_duration_s:.1f}s total\n"
             f"Guessed Surah: {guessed_surah_name}\n"
             f"Files saved to: {session.session_dir}"
         )
-        
+
         if qari_mode:
             summary = rt_streamer.correction_engine.get_session_summary()
             print(f"Session accuracy: {summary['accuracy']}%")
             print(f"Errors: {summary['total_errors']}, Skipped: {summary['skipped_ayahs']}")
 
-        session_wav = session.session_wav_path if os.path.isfile(session.session_wav_path) else None
         yield (
             status, merged_html, progress_html, error_html, all_raw, all_corrected,
-            chunks_table, comparison, eval_report, guessed_surah_name, badge_html, session_wav, ""
+            chunks_table, guessed_surah_name, badge_html
         )
 
     except Exception as e:
@@ -1175,7 +1175,7 @@ def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=F
         yield (
             f"🔴 Session ended with error: {e}",
             merged_html, progress_html, error_html, all_raw, all_corrected,
-            chunks_table, "", {}, guessed, badge_html, None, "",
+            chunks_table, guessed, badge_html,
         )
 
 
@@ -1205,8 +1205,8 @@ def _preload_live_model():
 # ---------------------------------------------------------------------------
 
 _APP_CSS = """
-/* Hide Tab Navigation Bar */
-.tabs > .tab-nav, .tab-nav, div[role="tablist"], button[role="tab"], .tabs-nav, .tab-buttons {
+/* Hide Gradio's default footer (Use via API / Built with Gradio / Settings) */
+footer {
     display: none !important;
 }
 
@@ -1312,67 +1312,6 @@ button.stop, .btn-stop button {
     background: #131b28;
 }
 
-/* Settings gear button */
-.sidebar-top-row {
-    justify-content: flex-end !important;
-    align-items: center !important;
-    gap: 0 !important;
-}
-.settings-gear-btn, .settings-gear-btn button {
-    width: 42px !important;
-    min-width: 42px !important;
-    height: 42px !important;
-    padding: 0 !important;
-    border-radius: 12px !important;
-    font-size: 1.15rem !important;
-    flex: none !important;
-}
-
-/* Settings popup (Qari Mode + Tajweed Detection) — visibility is fully
-   controlled by the .modal-hidden class we toggle ourselves, not by
-   Gradio's own visible= prop, so there's no conflict with however a given
-   Gradio version implements component hiding internally. */
-.settings-modal-overlay {
-    position: fixed !important;
-    inset: 0 !important;
-    width: 100vw !important;
-    height: 100vh !important;
-    background: rgba(5, 8, 13, 0.72) !important;
-    backdrop-filter: blur(3px);
-    display: flex;
-    align-items: center !important;
-    justify-content: center !important;
-    padding: 20px !important;
-    z-index: 9999 !important;
-}
-.settings-modal-overlay.modal-hidden {
-    display: none !important;
-    pointer-events: none !important;
-}
-.settings-modal-card {
-    max-width: 420px !important;
-    width: 100% !important;
-    background: #131b28 !important;
-    border: 1px solid rgba(79, 179, 196, 0.28) !important;
-    border-radius: 20px !important;
-    padding: 22px !important;
-    box-shadow: 0 30px 70px rgba(0, 0, 0, 0.55) !important;
-}
-.settings-close-btn, .settings-close-btn button {
-    width: 100% !important;
-    margin-top: 6px !important;
-    background: #16202f !important;
-    color: #cfe0ee !important;
-    border: 1px solid rgba(79, 179, 196, 0.35) !important;
-    border-radius: 999px !important;
-    font-weight: 700 !important;
-    box-shadow: none !important;
-}
-.settings-close-btn button:hover {
-    background: #1c2a3d !important;
-    border-color: #4fb3c4 !important;
-}
-
 /* Hide the mic component's native toolbar overflow ("⋯") menu —
    best-effort: Gradio's exact internal class name for this varies by
    version, so several common patterns are covered; any that don't match
@@ -1388,254 +1327,207 @@ button.stop, .btn-stop button {
 """
 
 with gr.Blocks(title="Hafizify — Quran ASR") as app:
+    with gr.Row():
+        gr.Markdown(
+            "# 📖 Hafizify — Quran ASR with Real-Time Recitation"
+        )
+        active_tajweed_checkbox = gr.Checkbox(
+            value=False,
+            label="Active Tajweed Detection",
+            info="On: Combined Groq + Local, harakaat-aware, via remote API (needs internet). Off: local offline model.",
+            scale=0,
+            min_width=260,
+        )
+
+    qari_mode_state = gr.State(True)
+
     gr.Markdown(
-        "# 📖 Hafizify — Quran ASR with Real-Time Recitation"
+        "### Real-Time Quran Recitation\n"
+        "Select your surah, configure settings, then click **Start** "
+        "and begin reciting. VAD-based chunking splits audio on silence "
+        "for accurate word boundaries."
     )
 
-    with gr.Tabs():
-        # =====================================================================
-        # TAB 1: Live Recitation (NEW)
-        # =====================================================================
-        with gr.Tab("🎙️ Live Recitation", id="live_tab"):
-            gr.Markdown(
-                "### Real-Time Quran Recitation\n"
-                "Select your surah, configure settings, then click **Start** "
-                "and begin reciting. VAD-based chunking splits audio on silence "
-                "for accurate word boundaries."
+    with gr.Row():
+        # ---- Left: Controls ----
+        with gr.Column(scale=1, elem_classes=["sidebar-col"]):
+            live_status = gr.Textbox(
+                label="Session Status",
+                value="⚪ Ready — Configure settings and click Start",
+                interactive=False,
+                elem_classes=["live-status"],
+                visible=False,
             )
 
-            with gr.Row():
-                # ---- Left: Controls ----
-                with gr.Column(scale=1, elem_classes=["sidebar-col"]):
-                    with gr.Row(elem_classes=["sidebar-top-row"]):
-                        settings_btn = gr.Button("⚙️", elem_classes=["settings-gear-btn"], size="sm")
-                    live_status = gr.Textbox(
-                        label="Session Status",
-                        value="⚪ Ready — Configure settings and click Start",
-                        interactive=False,
-                        elem_classes=["live-status"],
-                        visible=False,
-                    )
-
-                    with gr.Accordion("📋 Recitation Settings", open=True):
-                        live_model_selector = gr.Dropdown(
-                            choices=MODEL_CHOICES,
-                            value="whisper-base-quran-lora",
-                            label="🤖 ASR Model",
-                            visible=False,
-                        )
-                        live_asr_engine_selector = gr.Radio(
-                            choices=[
-                                "Standard (offline, fast)",
-                                "Combined (Groq + Local, harakaat-aware, needs internet)",
-                            ],
-                            value="Standard (offline, fast)",
-                            label="⚙️ ASR Engine",
-                            info="Combined Mode: requires internet + GPU, more accurate diacritics.",
-                            visible=False,
-                        )
-                        surah_dropdown = gr.Dropdown(
-                            choices=SURAH_NAMES,
-                            value="1 - Al-Fatiha",
-                            label="Surah",
-                        )
-                        start_ayah_input = gr.Number(
-                            value=1,
-                            label="Start Ayah",
-                            minimum=1,
-                            maximum=286,
-                            precision=0,
-                            visible=False,
-                        )
-                        live_correction_mode = gr.Dropdown(
-                            ["safe", "balanced", "aggressive"],
-                            value="balanced",
-                            label="Correction Mode",
-                            visible=False,
-                        )
-                        auto_surah_detect_checkbox = gr.Checkbox(
-                            value=False,
-                            label="Auto Surah Detection",
-                            info="Disable automatic surah locking and guessing",
-                            visible=False,
-                        )
-
-                    with gr.Column(elem_classes=["settings-modal-overlay", "modal-hidden"]) as settings_modal:
-                        with gr.Group(elem_classes=["settings-modal-card"]):
-                            gr.Markdown("### ⚙️ Advanced Settings")
-                            qari_mode_checkbox = gr.Checkbox(
-                                value=False,
-                                label="🎙️ Interactive Qari Mode",
-                                info="Enables interactive TTS feedback to correct recitation mistakes.",
-                            )
-                            tajweed_toggle = gr.Checkbox(
-                                value=False,
-                                label="🎯 Active Tajweed Detection",
-                                info="On: Combined Groq + Local, harakaat-aware (needs internet). Off: local offline model.",
-                            )
-                            use_api_combined_checkbox = gr.Checkbox(
-                                value=False,
-                                label="🌐 Use Remote API for Combined Mode",
-                                info="Send Combined Mode chunks to a running api/main.py server (POST /transcribe) "
-                                     "instead of loading Groq + the local turbo model in this process. Ignored in "
-                                     "Standard Mode.",
-                            )
-                            api_base_url_input = gr.Textbox(
-                                value="http://127.0.0.1:8000",
-                                label="API Base URL",
-                                info="Only used when 'Use Remote API for Combined Mode' is on.",
-                            )
-                            close_settings_btn = gr.Button("Close", elem_classes=["settings-close-btn"], size="sm")
-
-                    with gr.Accordion("⚙️ Chunk Settings", open=False, visible=False):
-                        use_vad_checkbox = gr.Checkbox(
-                            value=True,
-                            label="🧠 Use VAD Chunking (recommended)",
-                            info="Split audio on silence instead of fixed time windows",
-                        )
-                        chunk_duration_slider = gr.Slider(
-                            minimum=3.0,
-                            maximum=10.0,
-                            value=5.0,
-                            step=0.5,
-                            label="Chunk Duration (fallback if VAD off)",
-                        )
-                        overlap_slider = gr.Slider(
-                            minimum=0.5,
-                            maximum=3.0,
-                            value=1.5,
-                            step=0.5,
-                            label="Overlap Duration (fallback if VAD off)",
-                        )
-
-                    start_session_btn = gr.Button(
-                        "▶️ Start Session",
-                        elem_classes=["btn-start"],
-                        variant="primary",
-                    )
-
-                    mic_input = gr.Audio(
-                        sources=["microphone"],
-                        streaming=True,
-                        label="🎤 Tap Record to Start/Stop Reciting",
-                        type="numpy",
-                        elem_classes=["mic-visualizer"],
-                    )
-
-                # ---- Right: Live Output ----
-                with gr.Column(scale=2, elem_classes=["main-col"]):
-                    guessed_surah_box = gr.Textbox(
-                        label="🔍 Guessed Surah (auto-detected)",
-                        value="Listening...",
-                        interactive=False,
-                        visible=False,
-                    )
-
-                    surah_badge_html = gr.HTML(
-                        label="Surah Lock",
-                        value=_format_surah_badge(None),
-                        visible=False,
-                    )
-                    
-                    correction_status_box = gr.HTML(
-                        label="Qari Mode Status",
-                        value="",
-                    )
-
-                    live_merged_display = gr.HTML(
-                        label="Expected Ayah (Word-by-Word)",
-                        value=LiveDisplayFormatter._placeholder_html("Start reciting..."),
-                        visible=False,
-                    )
-
-                    surah_progress_display = gr.HTML(
-                        label="Full Surah Progress",
-                        value=LiveDisplayFormatter._placeholder_html("Surah progress will appear here."),
-                    )
-
-                    error_panel = gr.HTML(
-                        label="Error Analysis",
-                        value=LiveDisplayFormatter._error_panel_html(0, 0, 0, 0, 0, 0.0),
-                        visible=False,
-                    )
-
-                    with gr.Accordion("📝 Raw vs Corrected", open=False, visible=False):
-                        with gr.Row():
-                            raw_asr_box = gr.Textbox(
-                                label="Raw ASR Output",
-                                lines=3,
-                                interactive=False,
-                                rtl=True,
-                                elem_classes=["transcript-box"],
-                            )
-                            corrected_box = gr.Textbox(
-                                label="Corrected (Quran-aware)",
-                                lines=3,
-                                interactive=False,
-                                rtl=True,
-                                elem_classes=["transcript-box"],
-                            )
-
-                    with gr.Accordion("📊 Chunk Details", open=False):
-                        chunks_table_md = gr.HTML(
-                            value="<div class='chunk-table'>No chunks yet.</div>",
-                        )
-
-            # Comparison section (shown after stopping)
-            with gr.Accordion("📊 Session Comparison (after stop)", open=False):
-                comparison_md = gr.Markdown(
-                    value="*Stop the session to see the comparison.*"
+            with gr.Accordion("📋 Recitation Settings", open=True):
+                live_model_selector = gr.Dropdown(
+                    choices=MODEL_CHOICES,
+                    value="whisper-base-quran-lora",
+                    label="🤖 ASR Model",
+                    visible=False,
                 )
+                live_asr_engine_selector = gr.Radio(
+                    choices=[
+                        "Standard (offline, fast)",
+                        "Combined (Groq + Local, harakaat-aware, needs internet)",
+                    ],
+                    value="Standard (offline, fast)",
+                    label="⚙️ ASR Engine",
+                    info="Combined Mode: requires internet + GPU, more accurate diacritics.",
+                    visible=False,
+                )
+                surah_dropdown = gr.Dropdown(
+                    choices=SURAH_NAMES,
+                    value="1 - Al-Fatiha",
+                    label="Surah",
+                )
+                start_ayah_input = gr.Number(
+                    value=1,
+                    label="Start Ayah",
+                    minimum=1,
+                    maximum=286,
+                    precision=0,
+                    visible=False,
+                )
+                live_correction_mode = gr.Dropdown(
+                    ["safe", "balanced", "aggressive"],
+                    value="balanced",
+                    label="Correction Mode",
+                    visible=False,
+                )
+                auto_surah_detect_checkbox = gr.Checkbox(
+                    value=False,
+                    label="Auto Surah Detection",
+                    info="Disable automatic surah locking and guessing",
+                    visible=False,
+                )
+                api_base_url_input = gr.Textbox(
+                    value="http://127.0.0.1:8000",
+                    label="API Base URL",
+                    info="Used when Active Tajweed Detection is on (Combined Mode via remote API).",
+                )
+
+            with gr.Accordion("⚙️ Chunk Settings", open=False, visible=False):
+                use_vad_checkbox = gr.Checkbox(
+                    value=True,
+                    label="🧠 Use VAD Chunking (recommended)",
+                    info="Split audio on silence instead of fixed time windows",
+                )
+                chunk_duration_slider = gr.Slider(
+                    minimum=3.0,
+                    maximum=10.0,
+                    value=5.0,
+                    step=0.5,
+                    label="Chunk Duration (fallback if VAD off)",
+                )
+                overlap_slider = gr.Slider(
+                    minimum=0.5,
+                    maximum=3.0,
+                    value=1.5,
+                    step=0.5,
+                    label="Overlap Duration (fallback if VAD off)",
+                )
+
+            start_session_btn = gr.Button(
+                "▶️ Start Session",
+                elem_classes=["btn-start"],
+                variant="primary",
+            )
+
+            mic_input = gr.Audio(
+                sources=["microphone"],
+                streaming=True,
+                label="🎤 Tap Record to Start/Stop Reciting",
+                type="numpy",
+                elem_classes=["mic-visualizer"],
+            )
+
+        # ---- Right: Live Output ----
+        with gr.Column(scale=2, elem_classes=["main-col"]):
+            guessed_surah_box = gr.Textbox(
+                label="🔍 Guessed Surah (auto-detected)",
+                value="Listening...",
+                interactive=False,
+                visible=False,
+            )
+
+            surah_badge_html = gr.HTML(
+                label="Surah Lock",
+                value=_format_surah_badge(None),
+                visible=False,
+            )
+
+            live_merged_display = gr.HTML(
+                label="Expected Ayah (Word-by-Word)",
+                value=LiveDisplayFormatter._placeholder_html("Start reciting..."),
+                visible=False,
+            )
+
+            surah_progress_display = gr.HTML(
+                label="Full Surah Progress",
+                value=LiveDisplayFormatter._placeholder_html("Surah progress will appear here."),
+            )
+
+            error_panel = gr.HTML(
+                label="Error Analysis",
+                value=LiveDisplayFormatter._error_panel_html(0, 0, 0, 0, 0, 0.0),
+                visible=False,
+            )
+
+            with gr.Accordion("📝 Raw vs Corrected", open=False, visible=False):
                 with gr.Row():
-                    session_eval_json = gr.JSON(label="Full Session Error Analysis")
-                    session_audio_output = gr.Audio(
-                        label="Full Session Recording",
-                        type="filepath",
+                    raw_asr_box = gr.Textbox(
+                        label="Raw ASR Output",
+                        lines=3,
                         interactive=False,
+                        rtl=True,
+                        elem_classes=["transcript-box"],
+                    )
+                    corrected_box = gr.Textbox(
+                        label="Corrected (Quran-aware)",
+                        lines=3,
+                        interactive=False,
+                        rtl=True,
+                        elem_classes=["transcript-box"],
                     )
 
-            # ---- Event wiring ----
-            settings_btn.click(
-                fn=lambda: gr.update(elem_classes=["settings-modal-overlay"]),
-                outputs=[settings_modal],
-            )
-            close_settings_btn.click(
-                fn=lambda: gr.update(elem_classes=["settings-modal-overlay", "modal-hidden"]),
-                outputs=[settings_modal],
-            )
+            with gr.Accordion("📊 Chunk Details", open=False):
+                chunks_table_md = gr.HTML(
+                    value="<div class='chunk-table'>No chunks yet.</div>",
+                )
 
-            tajweed_toggle.change(
-                fn=lambda active: (
-                    "Combined (Groq + Local, harakaat-aware, needs internet)"
-                    if active else "Standard (offline, fast)"
-                ),
-                inputs=[tajweed_toggle],
-                outputs=[live_asr_engine_selector],
-            )
+    # ---- Event wiring ----
+    active_tajweed_checkbox.change(
+        fn=lambda active: (
+            "Combined (Groq + Local, harakaat-aware, needs internet)"
+            if active else "Standard (offline, fast)"
+        ),
+        inputs=[active_tajweed_checkbox],
+        outputs=[live_asr_engine_selector],
+    )
 
-            # Start Session button loads the model + creates the session BEFORE
-            # the mic ever opens, so create_session()'s _ensure_model_loaded()
-            # blocking call can never race with the browser's first streaming
-            # audio upload (that race caused ffmpeg CouldntDecodeError on Record tap).
-            start_session_btn.click(
-                fn=start_live_session,
-                inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox],
-                outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, comparison_md, surah_badge_html, correction_status_box],
-            )
+    # Start Session button loads the model + creates the session BEFORE
+    # the mic ever opens, so create_session()'s _ensure_model_loaded()
+    # blocking call can never race with the browser's first streaming
+    # audio upload (that race caused ffmpeg CouldntDecodeError on Record tap).
+    start_session_btn.click(
+        fn=start_live_session,
+        inputs=[surah_dropdown, start_ayah_input, chunk_duration_slider, overlap_slider, live_model_selector, use_vad_checkbox, auto_surah_detect_checkbox, qari_mode_state, live_asr_engine_selector, active_tajweed_checkbox, api_base_url_input],
+        outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, surah_badge_html],
+    )
 
-            mic_input.stream(
-                fn=process_streaming_audio,
-                inputs=[mic_input, live_correction_mode, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox, api_base_url_input],
-                outputs=[live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html, correction_status_box],
-            )
+    mic_input.stream(
+        fn=process_streaming_audio,
+        inputs=[mic_input, live_correction_mode, qari_mode_state, live_asr_engine_selector, active_tajweed_checkbox, api_base_url_input],
+        outputs=[live_merged_display, surah_progress_display, error_panel, raw_asr_box, corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html],
+    )
 
-            mic_input.stop_recording(
-                fn=stop_live_session,
-                inputs=[live_correction_mode, qari_mode_checkbox, live_asr_engine_selector, use_api_combined_checkbox, api_base_url_input],
-                outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
-                         corrected_box, chunks_table_md, comparison_md,
-                         session_eval_json, guessed_surah_box, surah_badge_html, session_audio_output, correction_status_box],
-            )
+    mic_input.stop_recording(
+        fn=stop_live_session,
+        inputs=[live_correction_mode, qari_mode_state, live_asr_engine_selector, active_tajweed_checkbox, api_base_url_input],
+        outputs=[live_status, live_merged_display, surah_progress_display, error_panel, raw_asr_box,
+                 corrected_box, chunks_table_md, guessed_surah_box, surah_badge_html],
+    )
 
     app.load(fn=_preload_live_model)
 

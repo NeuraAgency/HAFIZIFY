@@ -57,6 +57,17 @@ OTHMANI_GLYPHS_RE = re.compile(r"[\u0671\u0653\u0654\u0655]")
 
 LOCAL_MODEL_ID = "MaddoggProduction/whisper-l-v3-turbo-quran-lora-dataset-mix"
 
+# Docker's docker-compose.yml mounts a local copy of this exact model at
+# /app/whisper-l-v3-turbo-quran-lora-dataset-mix specifically so the
+# container never has to hit the network for it (already contains
+# config.json/model.safetensors/tokenizer files — a complete, ready-to-load
+# checkpoint). _load_local_pipeline() below now loads from there first when
+# present. LOCAL_MODEL_ID (the HF Hub repo id) is the fallback for any
+# environment without that mount (e.g. running this file directly outside
+# Docker) — kept as-is for that case, cache-then-download exactly like
+# before.
+_LOCAL_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whisper-l-v3-turbo-quran-lora-dataset-mix")
+
 
 # ---------------------------------------------------------------------------
 # Lazy local-model loader
@@ -81,33 +92,47 @@ def _load_local_pipeline():
     device_available = torch.cuda.is_available()
     dtype = torch.float16 if device_available else torch.float32
 
-    # Try the local HF cache first (local_files_only=True) so a machine with
-    # no/unreliable internet never even attempts the network "check for
-    # updates" HEAD request. Observed failure mode without this: on a
-    # machine with DNS resolution failing (getaddrinfo failed), that request
-    # retries 5 times, fails, and leaves huggingface_hub's underlying HTTP
-    # client in a broken state ("Cannot send a request, as the client has
-    # been closed") — which silently killed every subsequent local-model
-    # call for the rest of the process's life, not just the first one. Only
-    # falls through to a real network download if nothing is cached yet
-    # (first run on a fresh machine).
-    try:
-        processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID, local_files_only=True)
+    if os.path.isdir(_LOCAL_MODEL_DIR) and os.path.isfile(os.path.join(_LOCAL_MODEL_DIR, "config.json")):
+        # The mounted local checkpoint (see the _LOCAL_MODEL_DIR comment
+        # above) — loaded straight off disk, no network involved at all.
+        # This is the path Docker deployments should always hit.
+        processor = AutoProcessor.from_pretrained(_LOCAL_MODEL_DIR)
         model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            LOCAL_MODEL_ID,
-            torch_dtype=dtype,
-            device_map="auto" if device_available else None,
-            local_files_only=True,
-        )
-        print("[Combined Mode] Loaded local turbo model from HF cache (offline, no network call).")
-    except Exception as e:
-        print(f"[Combined Mode] Not found in local HF cache ({e!r}); downloading from HuggingFace Hub...")
-        processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID)
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            LOCAL_MODEL_ID,
+            _LOCAL_MODEL_DIR,
             torch_dtype=dtype,
             device_map="auto" if device_available else None,
         )
+        print(f"[Combined Mode] Loaded local turbo model from mounted directory {_LOCAL_MODEL_DIR} (no network call).")
+    else:
+        # Fallback for environments without the local mount (e.g. running
+        # this file directly, outside Docker). Try the local HF cache first
+        # (local_files_only=True) so a machine with no/unreliable internet
+        # never even attempts the network "check for updates" HEAD request.
+        # Observed failure mode without this: on a machine with DNS
+        # resolution failing (getaddrinfo failed), that request retries 5
+        # times, fails, and leaves huggingface_hub's underlying HTTP client
+        # in a broken state ("Cannot send a request, as the client has been
+        # closed") — which silently killed every subsequent local-model call
+        # for the rest of the process's life, not just the first one. Only
+        # falls through to a real network download if nothing is cached yet
+        # (first run on a fresh machine).
+        try:
+            processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID, local_files_only=True)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                LOCAL_MODEL_ID,
+                torch_dtype=dtype,
+                device_map="auto" if device_available else None,
+                local_files_only=True,
+            )
+            print("[Combined Mode] Loaded local turbo model from HF cache (offline, no network call).")
+        except Exception as e:
+            print(f"[Combined Mode] Not found in local HF cache ({e!r}); downloading from HuggingFace Hub...")
+            processor = AutoProcessor.from_pretrained(LOCAL_MODEL_ID)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                LOCAL_MODEL_ID,
+                torch_dtype=dtype,
+                device_map="auto" if device_available else None,
+            )
     if not device_available:
         model = model.to("cpu")
 

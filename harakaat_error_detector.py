@@ -186,6 +186,16 @@ class WordAnnotation:
     predicted_word: str
     reference_word: Optional[str]
     status: str  # "ok" | "harakaat_error" | "makhraj_error" | "missing" | "extra"
+    # Position of this word in the REFERENCE ayah (not the predicted text —
+    # `index` above is the predicted-text position, which can differ from
+    # the reference position after an insert/delete elsewhere in the
+    # comparison). Needed to look up the correct word in the ayah's audio
+    # segments for correction playback (masterplan.md §10 — harakaat errors
+    # now trigger the full CORRECTING/VERIFYING audio-correction flow, same
+    # as word errors, and that flow needs a reference-ayah word position,
+    # not a predicted-text one). None for "missing"/"extra", which don't
+    # have a stable single reference position.
+    ref_index: Optional[int] = None
     # False when this word's predicted form carried no diacritics at all
     # (hybrid_diacritic_pipeline had no confident local-model match to pull
     # harakaat from for it) — per Hamza: an undiacritized word should only
@@ -274,7 +284,7 @@ def detect_harakaat_errors(
                     # in this "equal" branch), so the word itself is correct;
                     # just don't make a harakaat claim about it either way.
                     annotations.append(
-                        WordAnnotation(pred_idx, pred_word, ref_word, "ok", harakaat_checked=False)
+                        WordAnnotation(pred_idx, pred_word, ref_word, "ok", ref_index=ref_idx, harakaat_checked=False)
                     )
                     continue
 
@@ -298,6 +308,7 @@ def detect_harakaat_errors(
                 annotations.append(
                     WordAnnotation(
                         pred_idx, pred_word, ref_word, status,
+                        ref_index=ref_idx,
                         final_vowel_skipped=is_last_word_of_ayah,
                     )
                 )

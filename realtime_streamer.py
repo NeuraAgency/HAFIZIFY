@@ -317,6 +317,46 @@ def _force_expected_ayah_if_behind(guard_result: dict, session: RecitationSessio
     guard_result["is_sequence_match"] = False
 
 
+def _flag_skipped_ayah_if_forward_jump(guard_result: dict, session: RecitationSession, ayah_map, correction_engine=None) -> None:
+    """Symmetric to _force_expected_ayah_if_behind(): if the matched ayah
+    jumped forward by 2 or more (the reciter skipped at least one full ayah
+    without saying it), force the expected ayah back into the result and
+    mark it an error — same override style the "behind" case already uses.
+    A jump of exactly +1 is normal forward progress and is left untouched.
+    """
+    expected_ayah = getattr(session, "current_ayah", None)
+    surah = getattr(session, "surah", None)
+    matched_ayah = guard_result.get("matched_ayah")
+
+    if expected_ayah is None or matched_ayah is None or surah is None:
+        return
+
+    try:
+        matched_ayah = int(matched_ayah)
+        expected_ayah = int(expected_ayah)
+        surah = int(surah)
+    except Exception:
+        return
+
+    if matched_ayah < expected_ayah + 2:
+        return  # same ayah or normal +1 progress — not a skip
+
+    fallback_text = ayah_map.get((surah, expected_ayah)) if ayah_map else None
+    if not fallback_text:
+        return
+
+    if correction_engine is not None and expected_ayah not in correction_engine.skipped_ayahs:
+        correction_engine.skipped_ayahs.append(expected_ayah)
+
+    guard_result["matched_ayah"] = expected_ayah
+    guard_result["matched_key"] = (surah, expected_ayah)
+    guard_result["matched_start_ayah"] = expected_ayah
+    guard_result["matched_end_ayah"] = expected_ayah
+    guard_result["matched_ayah_text"] = fallback_text
+    guard_result["is_sequence_match"] = False
+    guard_result["verdict"] = "error"
+
+
 def _is_repetition_loop(text: str, repeat_threshold: int = 4) -> bool:
     tokens = normalize_arabic(text).split()
     if len(tokens) < repeat_threshold:
@@ -931,6 +971,7 @@ class RealtimeStreamer:
                 guard_result["verdict"] = "error"
         elif qari_mode:
             _force_expected_ayah_if_behind(guard_result, session, self._ayah_map)
+            _flag_skipped_ayah_if_forward_jump(guard_result, session, self._ayah_map, self.correction_engine)
 
         if not getattr(session, "_guard_debug_printed", False):
             guard_debug = {
@@ -1269,7 +1310,8 @@ class RealtimeStreamer:
         if isinstance(matched_key, (tuple, list)) and len(matched_key) >= 2:
             harakaat_result = detect_harakaat_errors(raw_text, int(matched_key[0]), int(matched_key[1]))
             guard_result["harakaat_errors"] = [
-                {"index": w.index, "predicted": w.predicted_word, "reference": w.reference_word, "status": w.status}
+                {"index": w.index, "ref_index": w.ref_index, "predicted": w.predicted_word,
+                 "reference": w.reference_word, "status": w.status}
                 for w in harakaat_result.words if w.status == "harakaat_error"
             ]
             guard_result["harakaat_error_count"] = harakaat_result.harakaat_error_count

@@ -258,7 +258,8 @@ async def transcribe(
                 if isinstance(matched_key, (tuple, list)) and len(matched_key) >= 2:
                     harakaat_result = detect_harakaat_errors(raw_text, int(matched_key[0]), int(matched_key[1]))
                     harakaat_errors = [
-                        {"index": w.index, "predicted": w.predicted_word, "reference": w.reference_word, "status": w.status}
+                        {"index": w.index, "ref_index": w.ref_index, "predicted": w.predicted_word,
+                         "reference": w.reference_word, "status": w.status}
                         for w in harakaat_result.words if w.status == "harakaat_error"
                     ]
                     harakaat_error_count = harakaat_result.harakaat_error_count

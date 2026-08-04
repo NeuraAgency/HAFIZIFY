@@ -72,16 +72,28 @@ class QuranTrie:
         print(f"[QuranTrie] Built trie: {len(ayah_map)} ayahs, {len(self.surah_tries)} surahs")
 
     def get_hotwords(self, surah: Optional[int] = None, ayah: Optional[int] = None) -> list:
-        """Return hotword list for constrained decoding."""
+        """Return hotword list for constrained decoding.
+
+        Deliberately returns [] (no hotwords) rather than the flattened
+        full-Quran vocabulary when neither surah nor ayah is known yet (e.g.
+        before surah-lock in a live session). faster-whisper's `hotwords`
+        works by boosting decoder logits for the given tokens -- boosting
+        essentially the entire vocabulary at once isn't a useful constraint,
+        it's noise applied to nearly every token, and was measurably
+        corrupting early-chunk decode quality (especially on smaller models
+        like whisper-base, which has much less capacity to resist that bias
+        than whisper-large-v3/turbo). See realtime_streamer.py's
+        _decode_chunk() caller: ctx_surah/ctx_ayah are both None until
+        surah-lock happens, which itself needs coherent decoded text to
+        detect against -- so this used to create a self-reinforcing failure
+        where garbage hotwords produced garbage decodes that could never
+        accumulate enough signal to lock a surah and stop being garbage.
+        """
         if surah is not None and ayah is not None:
             return self.ayah_hotwords.get((surah, ayah), [])
         if surah is not None:
             return self.surah_hotwords.get(surah, [])
-        # Flatten all words — expensive, avoid if possible
-        all_words = set()
-        for words in self.surah_hotwords.values():
-            all_words.update(words)
-        return sorted(list(all_words))
+        return []
 
     def get_initial_prompt(self, surah: Optional[int], ayah: Optional[int], ayah_map: dict) -> str:
         """Build initial_prompt string for Whisper decoder context."""
