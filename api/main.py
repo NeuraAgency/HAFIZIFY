@@ -231,11 +231,13 @@ async def transcribe(
             # just as a one-shot stateless decode instead of per-VAD-chunk.
             # Lazy imports: the local turbo model only loads on first actual
             # use of this path, never on server startup or standard calls.
-            from hybrid_diacritic_pipeline import run_combined_transcription
+            from hybrid_diacritic_pipeline import run_combined_transcription, run_hybrid_combination_logic
             from harakaat_error_detector import detect_harakaat_errors
 
             with _INFERENCE_LOCK:
                 rt_streamer.ensure_ayah_map_loaded()
+
+                # Pass 1 — no ayah context yet, just enough to find one.
                 decode_result = run_combined_transcription(audio_np, SAMPLE_RATE)
                 raw_text = decode_result["combined_text"]
 
@@ -253,6 +255,20 @@ async def transcribe(
                     use_sequence_match=True,
                     sequence_max_ayahs=8,
                 )
+
+                # Pass 2 — reference-verified merge (same as
+                # process_chunk_combined()'s step 3a): rerun only the merge
+                # step against the SAME groq_text/local_text from pass 1, now
+                # that the matched ayah's reference text is known.
+                ref_text_for_merge = guard_result.get("matched_ayah_text") or ""
+                if ref_text_for_merge:
+                    verified_stages = run_hybrid_combination_logic(
+                        decode_result["groq_text"], decode_result["local_text"], ref_text=ref_text_for_merge,
+                    )
+                    verified_text = verified_stages["combined"]
+                    if verified_text != raw_text:
+                        raw_text = verified_text
+                        guard_result["raw_asr"] = raw_text
 
                 matched_key = guard_result.get("matched_key")
                 if isinstance(matched_key, (tuple, list)) and len(matched_key) >= 2:
