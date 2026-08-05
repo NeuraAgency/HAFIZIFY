@@ -52,6 +52,7 @@ from fyp_model.quran_guard import (
     correct_text_rules,
     guard_inference,
     get_word_error_annotations,
+    get_word_error_annotations_best_of,
     load_all_ayat_json,
     normalize_arabic,
 )
@@ -1204,7 +1205,7 @@ class RealtimeStreamer:
         """
         # Lazy imports — Combined Mode's local turbo model and Groq client are
         # only touched when this function actually runs, per masterplan §3.1.
-        from hybrid_diacritic_pipeline import run_combined_transcription
+        from hybrid_diacritic_pipeline import run_combined_transcription, run_hybrid_combination_logic
         from harakaat_error_detector import detect_harakaat_errors
 
         t0 = time.time()
@@ -1223,7 +1224,9 @@ class RealtimeStreamer:
                 chunk_end_sample=chunk_end_sample,
             )
 
-        # 1. Combined decode — diacritized text (masterplan §4.2 step 2)
+        # 1. Combined decode — first pass, no ayah context yet (masterplan
+        #    §4.2 step 2). Groq/local only ever decode once per chunk;
+        #    everything below reuses decode_result['groq_text']/['local_text'].
         decode_result = run_combined_transcription(chunk_audio.astype(np.float32), SAMPLE_RATE)
         raw_text = decode_result["combined_text"]
         decode_time = time.time() - t0
@@ -1289,6 +1292,29 @@ class RealtimeStreamer:
             lock_surah=lock_surah if session.surah is None else None,
         )
 
+        # 3a. Reference-verified second pass (masterplan §4.2 step 3, per
+        #     Hamza — "best of both" merge using the now-known matched ayah).
+        #     Re-runs only the merge step (run_hybrid_combination_logic), not
+        #     the ASR decode, against the SAME groq_text/local_text from step
+        #     1. For each word the first-pass merge still disagrees with the
+        #     reference on, adopts whichever engine actually said the
+        #     reference word at that slot; if neither did, that word is left
+        #     exactly as the first pass decided — a genuine mistake is never
+        #     replaced by the reference text. See run_hybrid_combination_logic's
+        #     stage 2b docstring for the full rule.
+        ref_text_for_merge = guard_result.get("matched_ayah_text") or ""
+        if ref_text_for_merge:
+            verified_stages = run_hybrid_combination_logic(
+                decode_result["groq_text"], decode_result["local_text"], ref_text=ref_text_for_merge,
+            )
+            verified_text = verified_stages["combined"]
+            if verified_text != raw_text:
+                print(f"[Chunk-Combined] Verified: {verified_text}")
+                raw_text = verified_text
+                decode_result["combined_text"] = verified_text
+                analysis_text = _strip_leading_invocations(raw_text, strip_basmala=strip_basmala_for_analysis)
+                guard_result["raw_asr"] = raw_text
+
         # 3b. Qari Mode word-level scoring (masterplan.md changelog, 2026-08-02)
         #     Mirrors process_chunk()'s qari_mode branch via _apply_qari_word_scoring
         #     so wrong_words/correction_spans/verdict feed the correction engine
@@ -1317,21 +1343,41 @@ class RealtimeStreamer:
             guard_result["harakaat_error_count"] = harakaat_result.harakaat_error_count
 
         # 5. Word-level error annotations (correct/minor/major/missing/extra)
-        # against the matched ayah — the same computation api/main.py's
-        # /transcribe endpoint already does for one-shot uploads, now also
-        # attached to the live per-chunk result so the WS client gets
-        # word-level verdicts on every streamed chunk, not just file uploads.
-        # Independent of qari_mode: _apply_qari_word_scoring above (when
-        # qari_mode is on) only keeps the flagged wrong_words/spans, not the
-        # full per-word list, so this is computed fresh regardless.
+        # against the matched ayah. Best-of-both-engines (2026-08-04,
+        # Claude/chat, per Hamza): the transcript backbone (raw_text /
+        # combined_text) always keeps Groq's word choice per
+        # hybrid_diacritic_pipeline.py's documented design — it never
+        # consults the reference, so an honest recitation mistake always
+        # stays visible in the transcript. But that means a case where Groq
+        # simply misheard a word into something completely different while
+        # Local heard it correctly (e.g. "وإذ" vs حقة "غير") used to be
+        # scored purely on Groq's wrong word, with no way for Local's better
+        # answer to ever count. get_word_error_annotations_best_of() aligns
+        # BOTH engines' raw output against the reference independently and
+        # takes whichever one actually matched at each word position — this
+        # only changes SCORING (word_errors), never the displayed transcript.
         ref_text_for_words = guard_result.get("matched_ayah_text") or ""
         if ref_text_for_words:
-            hyp_for_annotation = correct_text_rules(raw_text, mode="balanced")
-            guard_result["word_errors"] = get_word_error_annotations(
-                hyp_for_annotation,
-                ref_text_for_words,
-                confidence=guard_result.get("confidence"),
-            )
+            groq_hyp = correct_text_rules(decode_result.get("groq_text") or "", mode="balanced")
+            local_hyp = correct_text_rules(decode_result.get("local_text") or "", mode="balanced")
+            if groq_hyp and local_hyp:
+                guard_result["word_errors"] = get_word_error_annotations_best_of(
+                    groq_hyp,
+                    local_hyp,
+                    ref_text_for_words,
+                    primary_confidence=guard_result.get("confidence"),
+                    alt_confidence=guard_result.get("confidence"),
+                )
+            else:
+                # One engine returned nothing this chunk (failed/empty) —
+                # fall back to scoring whichever single hypothesis exists,
+                # same as before this change.
+                hyp_for_annotation = correct_text_rules(raw_text, mode="balanced")
+                guard_result["word_errors"] = get_word_error_annotations(
+                    hyp_for_annotation,
+                    ref_text_for_words,
+                    confidence=guard_result.get("confidence"),
+                )
         else:
             guard_result["word_errors"] = []
 

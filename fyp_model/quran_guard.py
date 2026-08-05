@@ -966,3 +966,86 @@ def get_word_error_annotations(
                 _append(hyp_word, "", "extra", hyp_index=j1 + hyp_offset)
 
     return annotations
+
+
+_STATUS_RANK = {"correct": 0, "minor": 1, "major": 2, "uncertain": 2, "missing": 3, "extra": 3}
+
+
+def get_word_error_annotations_best_of(
+    primary_hyp_text: str,
+    alt_hyp_text: str,
+    ref_text: str,
+    primary_confidence: Optional[float] = None,
+    alt_confidence: Optional[float] = None,
+) -> List[Dict[str, object]]:
+    """Best-of-both-engines word-level scoring for Combined Mode.
+
+    Combined Mode runs two independent ASR engines (Groq + the local turbo
+    model) on the same audio. hybrid_diacritic_pipeline.py's merge
+    deliberately keeps Groq's word choice as the transcript backbone at all
+    times (see that module's docstring) so the *transcript* stays an
+    honest, unbiased reconstruction of what was actually said — it never
+    peeks at the reference ayah to decide which engine's word is "right".
+    That's intentional: if the transcript itself adopted whichever word
+    looks more correct, a genuine recitation mistake could become
+    permanently undetectable, since error-detection runs on that transcript.
+
+    Word-level *scoring* is a different concern from the transcript, and is
+    allowed to consult the reference — that's its whole job, it's error
+    detection. This function aligns BOTH engines' raw output against the
+    same reference ayah independently (two separate get_word_error_annotations
+    calls), then for each reference-word position takes whichever engine's
+    aligned word actually matches best. This fixes cases where the
+    transcript backbone (Groq) missed or mangled a word that the other
+    engine (local) actually got right — e.g. Groq mishearing a word as a
+    completely different one while the local model heard it correctly —
+    without ever feeding the reference back into the displayed transcript.
+    A real recitation mistake is only masked here if BOTH engines
+    independently failed to catch it, which is a substantially higher bar
+    than trusting either engine alone.
+
+    hyp_index in the returned annotations always stays anchored to the
+    PRIMARY engine's word position (so it lines up with the transcript
+    actually shown to the user) — only word/status/similarity are swapped
+    in from the alternate engine when it did better at that reference
+    position.
+    """
+    primary_annotations = get_word_error_annotations(primary_hyp_text, ref_text, primary_confidence)
+    alt_annotations = get_word_error_annotations(alt_hyp_text, ref_text, alt_confidence)
+
+    # Index the alt engine's annotations by ref_index (position in the
+    # reference ayah) — this is what lets us compare "what did each engine
+    # think reference-word #4 was", even though the two engines' hyp texts
+    # may have drifted out of word-for-word sync with each other (extra/
+    # missing words affect their own alignments differently).
+    alt_by_ref_index: Dict[int, Dict[str, object]] = {
+        a["ref_index"]: a for a in alt_annotations if a.get("ref_index") is not None
+    }
+
+    merged: List[Dict[str, object]] = []
+    for primary in primary_annotations:
+        ref_idx = primary.get("ref_index")
+        alt = alt_by_ref_index.get(ref_idx) if ref_idx is not None else None
+
+        if alt is not None and _STATUS_RANK[alt["status"]] < _STATUS_RANK[primary["status"]]:
+            # The other engine matched the reference better at this
+            # position — adopt its word/status/similarity for scoring.
+            entry = dict(primary)
+            entry["word"] = alt["word"]
+            entry["status"] = alt["status"]
+            entry["similarity"] = alt["similarity"]
+            merged.append(entry)
+        else:
+            merged.append(primary)
+
+    # A reference word the primary engine's alignment skipped past entirely
+    # (no ref_index in its annotations for that position) but the alt
+    # engine's alignment did catch — surface it too, so scoring doesn't
+    # silently drop a word just because the primary alignment missed it.
+    covered_ref_indices = {p.get("ref_index") for p in primary_annotations}
+    for ref_idx, alt in alt_by_ref_index.items():
+        if ref_idx not in covered_ref_indices and alt["status"] != "extra":
+            merged.append(alt)
+
+    merged.sort(key=lambda a: (a.get("ref_index") is None, a.get("ref_index", 0), a.get("hyp_index") or 0))
+    return merged

@@ -40,7 +40,7 @@ import wave
 import difflib
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -187,6 +187,52 @@ def preload_local_pipeline() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Quran vocabulary (for word-choice arbitration only — see run_hybrid_
+# combination_logic below). NOT a per-ayah reference lookup: this is the
+# full set of every word that appears anywhere in the Quran, with no
+# information about which ayah/position is currently expected. Checking
+# "is this a real Quranic word at all" is a fair signal to arbitrate between
+# two ASR engines' disagreeing word choices — it never tells the merge what
+# the CORRECT word at this position was, only whether a candidate is a
+# plausible word in the language domain at all. This is a different, weaker
+# signal than consulting the matched ayah's reference text, which is what
+# the module docstring's "never consult ground truth" warning is about.
+# ---------------------------------------------------------------------------
+_quran_vocab: Optional[set] = None
+
+
+def _load_quran_vocab() -> set:
+    global _quran_vocab
+    if _quran_vocab is not None:
+        return _quran_vocab
+
+    _quran_vocab = set()
+    try:
+        import json
+        json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fyp_model", "all_ayat.json")
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for key in ("tafsir", "all_ayat", "verses", "data"):
+                if key in data and isinstance(data[key], dict):
+                    data = data[key]
+                    break
+        for value in data.values():
+            text = str(value.get("text", "")) if isinstance(value, dict) else str(value or "")
+            for word in text.split():
+                skeleton = smart_normalize_word(word)
+                if skeleton:
+                    _quran_vocab.add(skeleton)
+        print(f"[Combined Mode] Loaded {len(_quran_vocab)} unique Quran word skeletons for merge arbitration.")
+    except Exception as e:
+        print(f"[Combined Mode] Could not load Quran vocabulary for merge arbitration ({e!r}); "
+              f"word-choice arbitration will default to Groq on every disagreement.")
+        _quran_vocab = set()
+
+    return _quran_vocab
+
+
+# ---------------------------------------------------------------------------
 # Merge logic (cleaned up from the Colab draft)
 # ---------------------------------------------------------------------------
 
@@ -262,69 +308,223 @@ def inject_vowels_by_character_position(groq_word: str, local_voweled_word: str)
     return "".join(rebuilt)
 
 
-def run_hybrid_combination_logic(groq_raw_text: str, local_raw_text: str) -> str:
-    """Word-align Groq vs local output, keep Groq's consonants, inject local's
-    diacritics. No reference/ground-truth is consulted here on purpose —
-    see the module docstring."""
+def _strip_diacritics_only(word: str) -> str:
+    """Remove harakaat/othmani glyphs but keep the real letters as spoken
+    (no alef-variant folding) — used when a word is chosen as the combined1
+    backbone so its actual spelling survives, only vowels are dropped."""
+    return DIACRITICS_PATTERN.sub("", OTHMANI_GLYPHS_RE.sub("", word))
+
+
+def _choose_word_backbone(g_word: str, l_word: str, g_skel: str, l_skel: str):
+    """Stage 2 (combined1) arbitration for one aligned word slot.
+
+    This compares Groq's output to the LOCAL model's output — never to the
+    reference/expected ayah — so it is a fair ensemble decision between two
+    ASR engines, not the "answer key" problem the module docstring warns
+    about (nothing here is told which word was supposed to be recited).
+
+    Signal used: Quran-vocabulary membership (see _load_quran_vocab). If
+    the local model's word skeleton is an actual word that appears
+    somewhere in the Quran and Groq's isn't, that's real evidence Groq
+    hallucinated a non-Quranic word here — take local's word instead.
+    Every other case defaults to Groq, preserving the existing "Groq is the
+    backbone" behavior when there's no such signal.
+
+    Returns (chosen_bare_word, source) where source is 'groq' or 'local'.
+    """
+    vocab = _load_quran_vocab()
+    g_in_vocab = bool(g_skel) and g_skel in vocab
+    l_in_vocab = bool(l_skel) and l_skel in vocab
+    if l_in_vocab and not g_in_vocab:
+        return _strip_diacritics_only(l_word), "local"
+    return g_word, "groq"
+
+
+def _align_words_to_reference(words: List[str], words_stripped: List[str], ref_stripped: List[str]) -> Dict[int, dict]:
+    """Align one engine's word list to the reference word order — same
+    difflib-opcode approach get_word_error_annotations() in quran_guard.py
+    uses (reference first, hypothesis second), so combined1's word choice
+    and word_errors' scoring are judging "did this word match the reference"
+    the same way instead of two independently-drifting implementations.
+
+    Returns {ref_idx: {"word": <raw engine word>, "matched": bool}} for every
+    reference position this engine's output reached. matched=True means this
+    engine's word equals the reference at this position (difflib 'equal');
+    matched=False means this engine said something at this position but it
+    didn't match ('replace'). A reference position with no entry at all means
+    this engine said nothing there ('delete' — genuinely skipped/unreached).
+    """
+    aligned: Dict[int, dict] = {}
+    matcher = difflib.SequenceMatcher(None, ref_stripped, words_stripped, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                aligned[i1 + offset] = {"word": words[j1 + offset], "matched": True}
+        elif tag == "replace":
+            shared = min(i2 - i1, j2 - j1)
+            for offset in range(shared):
+                aligned[i1 + offset] = {"word": words[j1 + offset], "matched": False}
+    return aligned
+
+
+def _build_reference_aligned_combined1(
+    groq_words: List[str], local_words: List[str],
+    groq_stripped: List[str], local_stripped: List[str],
+    ref_text: str,
+) -> Tuple[List[str], Dict[int, str]]:
+    """Stage 2 (combined1), reference-aligned version — used once the ayah is
+    known (ref_text set). Per Hamza's spec: build combined1 word-by-word in
+    REFERENCE word order, taking whichever engine actually matched the
+    reference at that position (same principle get_word_error_annotations_
+    best_of() already uses for word_errors scoring, applied here to the
+    transcript itself instead of just the score).
+
+    Priority per reference position:
+      1. Groq matched the reference here -> use Groq's word.
+      2. Else local matched the reference here -> use local's word.
+      3. Else, whichever engine said SOMETHING at this position (even if
+         wrong) is kept as-is -> a genuine mistake stays visible, never
+         replaced by the reference word. Groq is preferred when both engines
+         got it wrong, same tie-break the old vocab-based backbone used.
+      4. Neither engine reached this position at all -> skip it (genuinely
+         unspoken, matches how word_errors would mark it 'missing').
+
+    Returns (combined1_words, vowel_donor) where vowel_donor[i] is the raw
+    (possibly diacritized) local-engine word to pull harakaat from for
+    combined1_words[i], when one is available.
+    """
+    ref_words = ref_text.strip().split()
+    ref_stripped = [smart_normalize_word(w) for w in ref_words]
+
+    groq_aligned = _align_words_to_reference(groq_words, groq_stripped, ref_stripped)
+    local_aligned = _align_words_to_reference(local_words, local_stripped, ref_stripped)
+
+    combined1_words: List[str] = []
+    vowel_donor: Dict[int, str] = {}
+
+    for ref_idx in range(len(ref_words)):
+        g = groq_aligned.get(ref_idx)
+        l = local_aligned.get(ref_idx)
+
+        if g and g["matched"]:
+            chosen_word, donor = g["word"], (l["word"] if l else None)
+        elif l and l["matched"]:
+            chosen_word, donor = _strip_diacritics_only(l["word"]), l["word"]
+        elif g:
+            chosen_word, donor = g["word"], (l["word"] if l else None)
+        elif l:
+            chosen_word, donor = _strip_diacritics_only(l["word"]), l["word"]
+        else:
+            continue  # neither engine said anything here — genuinely unspoken
+
+        pos = len(combined1_words)
+        combined1_words.append(chosen_word)
+        if donor:
+            vowel_donor[pos] = donor
+
+    return combined1_words, vowel_donor
+
+
+def run_hybrid_combination_logic(groq_raw_text: str, local_raw_text: str, ref_text: str = None) -> dict:
+    """Explicit stages, per Hamza's spec:
+
+      1. groq / local_normalized — each engine's own text; local_normalized
+         is local's output with diacritics stripped and alef variants
+         folded (its word skeletons), so word-CHOICE comparison in stage 2
+         isn't biased by which side happens to carry vowels.
+
+      2. combined1 — word-choice merge, best of both engines:
+         - No reference known yet (ref_text=None, the cheap first pass
+           whose only job is finding which ayah this is): pure two-engine
+           arbitration via _choose_word_backbone — keep Groq's word unless
+           local's is real Quran vocabulary and Groq's isn't. Never
+           consults ref_text, per this module's "never consult ground
+           truth without a match" rule.
+         - Reference known (ref_text set, the second pass after ayah
+           match): built word-by-word in REFERENCE order by
+           _build_reference_aligned_combined1 — whichever engine actually
+           matches the reference at each position wins; if neither does,
+           the mistake is kept exactly as whichever engine said it (never
+           papered over by the reference word). This is the "best of both
+           against the actual Quranic text" merge.
+
+      3. combined (final) — harakaat injection on top of whatever combined1
+         decided: local's diacritics are layered onto those words wherever
+         a confident alignment/donor exists.
+
+    Called twice in the live pipeline: once with ref_text=None (a cheap
+    first pass, just to find which ayah this is), and once more with
+    ref_text set to that matched ayah's reference text (the real, final
+    transcript) — see realtime_streamer.py's process_chunk_combined().
+    """
     groq_words = groq_raw_text.strip().split()
     local_words = local_raw_text.strip().split()
 
     groq_stripped = [smart_normalize_word(w) for w in groq_words]
     local_stripped = [smart_normalize_word(w) for w in local_words]
+    local_normalized = " ".join(local_stripped)
 
-    matcher = difflib.SequenceMatcher(None, groq_stripped, local_stripped)
-    local_word_mapping = {}
-    for tag, g_start, g_end, l_start, l_end in matcher.get_opcodes():
-        if tag == "equal":
-            for g_idx, l_idx in zip(range(g_start, g_end), range(l_start, l_end)):
-                local_word_mapping[g_idx] = local_words[l_idx]
-        elif tag == "replace" and (g_end - g_start) == (l_end - l_start):
-            # Not an exact skeleton match, but a same-count substitution
-            # block — i.e. difflib thinks these are probably the "same slot"
-            # words, just spelled differently after ASR. The local model
-            # tends to hallucinate consonants (wrong letter choice) while
-            # still tracking vowel timing/placement reasonably well, since
-            # that's driven more by acoustics than by language-model word
-            # choice. So: if a pair in this block is the same normalized
-            # length and differs by only a small edit distance (a
-            # near-miss, not a different word), still trust its vowel
-            # pattern. inject_vowels_by_character_position() only ever pulls
-            # the *diacritic* pattern from this local word — Groq's actual
-            # letters remain the backbone — so a wrong local letter never
-            # leaks into the output either way; the only thing at stake in
-            # this decision is whether we use the vowels or leave the word
-            # bare.
-            for offset, (g_idx, l_idx) in enumerate(zip(range(g_start, g_end), range(l_start, l_end))):
-                g_word, l_word = groq_stripped[g_idx], local_stripped[l_idx]
-                if _is_close_enough(g_word, l_word):
+    if ref_text:
+        combined1_words, vowel_donor = _build_reference_aligned_combined1(
+            groq_words, local_words, groq_stripped, local_stripped, ref_text,
+        )
+    else:
+        matcher = difflib.SequenceMatcher(None, groq_stripped, local_stripped)
+
+        # backbone[i] = (bare_word, source) — the combined1 decision for groq
+        # word slot i. Defaults to Groq's own bare word for any slot an opcode
+        # block below doesn't touch (e.g. groq-only "delete" blocks).
+        backbone = {idx: (word, "groq") for idx, word in enumerate(groq_words)}
+        # local_word_mapping[i] = the actual local word (WITH diacritics) to
+        # pull vowels from for slot i, when the chosen backbone word came from
+        # Groq and aligned closely enough to local's word at that slot, OR is
+        # itself the chosen local word (re-affirmed for harakaat injection).
+        local_word_mapping = {}
+
+        for tag, g_start, g_end, l_start, l_end in matcher.get_opcodes():
+            if tag == "equal":
+                for g_idx, l_idx in zip(range(g_start, g_end), range(l_start, l_end)):
                     local_word_mapping[g_idx] = local_words[l_idx]
 
-    final_words = []
-    for idx, groq_word in enumerate(groq_words):
-        # Only inject harakaat when difflib gave us a confident, aligned
-        # match for this exact groq word (an "equal" opcode block). There is
-        # deliberately no positional/index-guess fallback here anymore: if
-        # the sequences drifted (extra/missing/different words between Groq
-        # and local for this stretch), we do NOT pair groq_word with
-        # whatever local word happens to share its raw index — that produced
-        # garbage (e.g. an unrelated local word replacing a groq word
-        # wholesale, or two unrelated words' diacritics/consonants getting
-        # spliced together). Per Hamza: on a mismatch, keep Groq's word bare
-        # rather than guess.
-        if idx in local_word_mapping:
-            patched = inject_vowels_by_character_position(groq_word, local_word_mapping[idx])
-        else:
-            patched = groq_word
+            elif tag == "replace":
+                shared = min(g_end - g_start, l_end - l_start)
+                for offset in range(shared):
+                    g_idx = g_start + offset
+                    l_idx = l_start + offset
+                    g_word, l_word = groq_words[g_idx], local_words[l_idx]
+                    g_skel, l_skel = groq_stripped[g_idx], local_stripped[l_idx]
 
-        # Fixed version of the original "kasra eradication" rule — the old
-        # code had two branches that produced an identical result; only the
-        # 'starts with اهد' condition ever mattered.
+                    chosen_word, source = _choose_word_backbone(g_word, l_word, g_skel, l_skel)
+                    backbone[g_idx] = (chosen_word, source)
+
+                    if source == "local":
+                        local_word_mapping[g_idx] = l_word
+                    elif _is_close_enough(g_skel, l_skel):
+                        local_word_mapping[g_idx] = l_word
+
+        combined1_words = [backbone[idx][0] for idx in range(len(groq_words))]
+        vowel_donor = local_word_mapping
+
+    combined1 = " ".join(combined1_words)
+
+    # Stage 3 — harakaat injection onto combined1.
+    final_words = []
+    for idx, word in enumerate(combined1_words):
+        if idx in vowel_donor:
+            patched = inject_vowels_by_character_position(word, vowel_donor[idx])
+        else:
+            patched = word
+
         if patched.startswith("اِ"):
-            patched = ("اهْ" + patched[2:]) if groq_word.startswith("اهد") else ("ا" + patched[2:])
+            patched = ("اهْ" + patched[2:]) if word.startswith("اهد") else ("ا" + patched[2:])
 
         final_words.append(patched)
 
-    return " ".join(final_words)
+    return {
+        "local_normalized": local_normalized,
+        "combined1": combined1,
+        "combined": " ".join(final_words),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -365,10 +565,22 @@ def _collapse_exact_repeats(text: str) -> str:
 # Public entry point — this is what the app calls per VAD chunk
 # ---------------------------------------------------------------------------
 
-def run_combined_transcription(chunk_numpy: np.ndarray, sample_rate: int = 16000) -> dict:
+def run_combined_transcription(chunk_numpy: np.ndarray, sample_rate: int = 16000, ref_text: Optional[str] = None) -> dict:
     """Runs Groq + local model concurrently on one audio chunk and returns
     the merged diacritized transcription plus both raw outputs (useful for
-    debugging / eval, and for the standalone test harness below)."""
+    debugging / eval, and for the standalone test harness below).
+
+    ref_text: optional matched-ayah reference text (see
+    run_hybrid_combination_logic's stage 2b docstring). Pass None for a
+    cheap first pass with no ayah context yet; pass the matched ayah's text
+    for a second pass once one is known, to get the reference-verified
+    merge. The Groq/local decode itself never re-runs between passes —
+    callers should reuse groq_text/local_text from the first pass and call
+    run_hybrid_combination_logic() directly for a second pass instead of
+    calling this function twice. This function always does a fresh decode,
+    so it stays the single-pass entry point (used by the standalone test
+    harness and any ref_text=None caller).
+    """
     with ThreadPoolExecutor(max_workers=2) as executor:
         groq_future = executor.submit(transcribe_groq, chunk_numpy, sample_rate)
         local_future = executor.submit(transcribe_local, chunk_numpy, sample_rate)
@@ -380,7 +592,15 @@ def run_combined_transcription(chunk_numpy: np.ndarray, sample_rate: int = 16000
     groq_text = _collapse_exact_repeats(groq_text)
     local_text = _collapse_exact_repeats(local_text)
 
-    combined_text = run_hybrid_combination_logic(groq_text, local_text) if groq_text else local_text
+    if groq_text:
+        stages = run_hybrid_combination_logic(groq_text, local_text, ref_text=ref_text)
+    else:
+        # No Groq output this chunk — nothing to build a backbone from, so
+        # combined1/combined both just fall back to local's own text (same
+        # fallback behavior as before this change).
+        stages = {"local_normalized": local_text, "combined1": local_text, "combined": local_text}
+
+    combined_text = stages["combined"]
 
     if groq_text and local_text and combined_text == groq_text and DIACRITICS_PATTERN.search(local_text) and not DIACRITICS_PATTERN.search(combined_text):
         print(
@@ -391,6 +611,12 @@ def run_combined_transcription(chunk_numpy: np.ndarray, sample_rate: int = 16000
     return {
         "groq_text": groq_text,
         "local_text": local_text,
+        # New (per Hamza's 3-stage spec): local's text with diacritics
+        # stripped/alef-folded, and the word-choice-only merge BEFORE
+        # harakaat injection — exposed for debugging/eval, not consumed by
+        # the live pipeline yet.
+        "local_normalized": stages["local_normalized"],
+        "combined1": stages["combined1"],
         "combined_text": combined_text,
     }
 
