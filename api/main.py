@@ -279,6 +279,12 @@ async def transcribe(
                         for w in harakaat_result.words if w.status == "harakaat_error"
                     ]
                     harakaat_error_count = harakaat_result.harakaat_error_count
+
+                print(f"[Transcribe-Combined] Groq raw:  {decode_result['groq_text']}")
+                print(f"[Transcribe-Combined] Local raw: {decode_result['local_text']}")
+                print(f"[Transcribe-Combined] Combined1 (best-of, no harakaat): {decode_result['combined1']}")
+                print(f"[Transcribe-Combined] Combined (+ harakaat):            {raw_text}")
+                print(f"[Transcribe-Combined] Harakaat errors ({harakaat_error_count}): {harakaat_errors or []}")
         else:
             with _INFERENCE_LOCK:
                 rt_streamer.set_model_choice(model_choice)
@@ -314,6 +320,9 @@ async def transcribe(
                 ref_text_for_words,
                 confidence=guard_result.get("confidence"),
             )
+
+        if asr_engine == "combined":
+            print(f"[Transcribe-Combined] Word errors: {word_errors}")
 
         return {
             "raw_asr": raw_text,

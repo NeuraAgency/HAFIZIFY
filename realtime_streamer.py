@@ -1232,12 +1232,6 @@ class RealtimeStreamer:
         decode_time = time.time() - t0
         detection_text = _strip_leading_invocations(raw_text, strip_basmala=True)
 
-        # Per-engine terminal output — confirms both models are actually
-        # running and lets you compare their raw outputs chunk by chunk.
-        print(f"[Chunk-Combined] Groq:     {decode_result['groq_text']}")
-        print(f"[Chunk-Combined] Local:    {decode_result['local_text']}")
-        print(f"[Chunk-Combined] Combined: {decode_result['combined_text']}")
-
         # 2. Rolling-window surah detection — same mechanism as process_chunk
         if not hasattr(session, "_detection_buffer"):
             session._detection_buffer = []
@@ -1385,6 +1379,16 @@ class RealtimeStreamer:
         guard_result["_decode_time_s"] = round(decode_time, 3)
         guard_result["_chunk_duration_s"] = round(chunk_duration, 2)
 
+        # Full per-chunk debug dump (per Hamza) — every stage of Combined
+        # Mode's output in one place: what each engine said, the best-of-
+        # both merge before/after harakaat injection, and both error lists.
+        print(f"[Chunk-Combined] Groq raw:        {decode_result['groq_text']}")
+        print(f"[Chunk-Combined] Local raw:       {decode_result['local_text']}")
+        print(f"[Chunk-Combined] Combined1 (best-of, no harakaat): {decode_result['combined1']}")
+        print(f"[Chunk-Combined] Combined (+ harakaat):            {raw_text}")
+        print(f"[Chunk-Combined] Harakaat errors ({guard_result.get('harakaat_error_count', 0)}): {guard_result.get('harakaat_errors', [])}")
+        print(f"[Chunk-Combined] Word errors: {guard_result.get('word_errors', [])}")
+
         result = session.register_chunk_result(
             chunk_audio, guard_result, None, lock_state,
             chunk_start_sample=chunk_start_sample,
@@ -1434,7 +1438,7 @@ class RealtimeStreamer:
         chunk_start_sample: int = None,
         chunk_end_sample: int = None,
         qari_mode: bool = False,
-        api_base_url: str = "http://127.0.0.1:8000",
+        api_base_url: str = "https://api.syedalihashmi.dev",
         model_choice: str = "groq-whisper-large-v3",
     ) -> ChunkResult:
         """Combined Mode via a remote api/main.py server's POST /transcribe,
@@ -1554,13 +1558,28 @@ class RealtimeStreamer:
             f"decode={decode_time:.2f}s | "
             f"raw='{guard_result.get('raw_asr','')[:50]}' | "
             f"verdict={result.verdict} | "
+            f"conf={guard_result.get('confidence')} | "
+            f"matched_ayah={guard_result.get('matched_ayah')} | "
+            f"cer={guard_result.get('cer')} wer={guard_result.get('wer')} | "
             f"harakaat_errors={guard_result.get('harakaat_error_count', 0)} | "
             f"surah={effective_surah} | api_ok={api_result is not None}"
         )
+        if api_result is not None:
+            print(f"[Chunk-API {result.chunk_index}] Word errors: {guard_result.get('word_errors', [])}")
 
         if qari_mode:
+            qari_verdict = guard_result.get("verdict", "unknown")
+            # CER/WER=0 is an exact ayah match. The remote endpoint has
+            # occasionally returned verdict="error" alongside these values;
+            # do not pause the reciter for that contradictory aggregate flag.
+            if (
+                not guard_result.get("harakaat_errors")
+                and guard_result.get("cer") == 0
+                and guard_result.get("wer") == 0
+            ):
+                qari_verdict = "ok"
             correction_result = self.correction_engine.process_verdict(
-                verdict=guard_result.get("verdict", "unknown"),
+                verdict=qari_verdict,
                 raw_asr=guard_result.get("raw_asr", ""),
                 correct_ayah_text=guard_result.get("matched_ayah_text", ""),
                 ayah_num=guard_result.get("matched_ayah"),

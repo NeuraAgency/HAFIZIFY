@@ -516,7 +516,29 @@ def run_hybrid_combination_logic(groq_raw_text: str, local_raw_text: str, ref_te
             patched = word
 
         if patched.startswith("اِ"):
-            patched = ("اهْ" + patched[2:]) if word.startswith("اهد") else ("ا" + patched[2:])
+            # "اِ" (alef+kasra) at the start of the local model's diacritized
+            # output is an artifact of how it renders the hamzat-wasl
+            # connecting vowel on "اهد"-family words (ihdina, etc.) — the
+            # correct Quranic spelling starts اه (alef+heh), not اِ. This
+            # rebuilds that prefix.
+            #
+            # Bug fixed 2026-08-05 (Claude, chat), reported by Hamza from a
+            # live "اهْهْدِنَا" output (doubled ه): the old code did
+            # `"اهْ" + patched[2:]` — but patched[2:] (everything after the
+            # 2-char اِ prefix) ALREADY starts with the word's own ه, since
+            # that's genuinely the word's second letter. Prepending "اهْ"
+            # (which also supplies a ه) duplicated it. Fixed by additionally
+            # stripping that redundant ه (plus whatever diacritic cluster
+            # follows it, whatever it turned out to be — not assuming it's
+            # always sukun) before prepending the corrected "اهْ" prefix.
+            remainder = patched[2:]
+            if word.startswith("اهد"):
+                redundant_heh = re.match(r"^ه[\u064B-\u0652\u0670]*", remainder)
+                if redundant_heh:
+                    remainder = remainder[redundant_heh.end():]
+                patched = "اهْ" + remainder
+            else:
+                patched = "ا" + remainder
 
         final_words.append(patched)
 

@@ -34,7 +34,6 @@ import torch
 import numpy as np
 import torchaudio
 import time
-import base64
 from urllib.parse import quote
 from transformers import (
     WhisperForConditionalGeneration,
@@ -45,7 +44,7 @@ from hybrid_pipeline import HybridViterbiPipeline
 from realtime_streamer import RealtimeStreamer, resample_to_16k
 from session_manager import RecitationSession
 from fyp_model.quran_guard import guard_inference, load_all_ayat_json, normalize_arabic
-from live_display_formatter import LiveDisplayFormatter
+from live_display_formatter import LiveDisplayFormatter, CONFIDENCE_UNCERTAIN_THRESHOLD
 from surah_detector import SurahDetector
 
 # ---------------------------------------------------------------------------
@@ -192,7 +191,7 @@ def _process_queue_worker():
             # remote-API fields) — unpack by length, oldest shape first, so
             # nothing already queued in an older shape ever breaks.
             use_api_combined = False
-            api_base_url = "http://127.0.0.1:8000"
+            api_base_url = "https://api.syedalihashmi.dev"
             if len(task) == 7:
                 session, chunk_tuple, correction_mode, qari_mode, asr_engine, use_api_combined, api_base_url = task
             elif len(task) == 5:
@@ -603,7 +602,7 @@ def start_live_session(
     qari_mode=False,
     asr_engine="Standard (offline, fast)",
     use_api_combined=False,
-    api_base_url="http://127.0.0.1:8000",
+    api_base_url="https://api.syedalihashmi.dev",
 ):
     """Initialize a new recording session when user clicks Start."""
     global _active_session, _worker_thread, _display_formatter
@@ -778,20 +777,70 @@ def _build_expected_ayah_html(session, formatter, qari_mode: bool) -> str:
     if formatter is None or session is None:
         return gr.update()
 
+    _sync_formatter_word_status(session, formatter)
+
     recited_text = ""
     harakaat_errors = None
+    word_errors = None
     if session.chunk_results:
         last = session.chunk_results[-1]
-        if last.matched_ayah == session.current_ayah:
-            recited_text = last.corrected_text or ""
+        # Bug fix (2026-08-05, per Hamza): a chunk this unreliable (ASR
+        # noise/hallucination, not a real recitation attempt) was still
+        # getting diffed against the real reference words in
+        # _update_word_status(), which could paint words the reciter never
+        # even said as "wrong" (red) — and that false status is exactly as
+        # sticky as a real one. Gated on CONFIDENCE only, not verdict: a
+        # confidently-wrong recitation (high confidence, genuinely wrong
+        # words) should still show red — that's the whole point of red.
+        # Only low-confidence/garbled output is excluded from counting as an
+        # attempt at all.
+        is_reliable = last.confidence is None or last.confidence >= CONFIDENCE_UNCERTAIN_THRESHOLD
+        if last.matched_ayah == session.current_ayah and is_reliable:
+            # Highlight against what the ASR actually heard.  corrected_text
+            # is for transcript readability and can replace a near-miss with
+            # the Quran reference; using it here falsely paints that mistake
+            # green in the word-by-word recitation display.
+            recited_text = last.raw_asr or ""
             harakaat_errors = last.harakaat_errors
+            word_errors = last.word_errors
 
     return formatter.format_expected_ayah_html(
         session.surah,
         session.current_ayah,
         recited_text,
         harakaat_errors=harakaat_errors,
+        word_errors=word_errors,
     )
+
+
+def _sync_formatter_word_status(session, formatter) -> None:
+    """Replay completed API annotations into the formatter's sticky state.
+
+    ASR runs on a background worker while Gradio renders on microphone
+    callbacks. Several results can therefore finish between two renders; if
+    the UI looked at only ``chunk_results[-1]``, a correctly re-read ayah
+    could be skipped entirely and never change back to green. Replaying the
+    authoritative per-word annotations is idempotent and keeps the display
+    synchronized with every completed chunk, not merely the last one.
+    """
+    surah = getattr(session, "surah", None)
+    if surah is None:
+        return
+
+    for result in getattr(session, "chunk_results", []):
+        ayah = getattr(result, "matched_ayah", None)
+        annotations = getattr(result, "word_errors", None)
+        if ayah is None or not annotations:
+            continue
+        ref_text = formatter.get_raw_ayah_text(surah, ayah)
+        ref_words = ref_text.split() if ref_text else []
+        if not ref_words:
+            continue
+        formatter._update_word_status(
+            int(surah), int(ayah), ref_words, [],
+            harakaat_errors=getattr(result, "harakaat_errors", None),
+            word_errors=annotations,
+        )
 
 
 def _stable_html_update(session, key: str, value: object) -> object:
@@ -810,13 +859,23 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
     if formatter is None or session is None:
         return gr.update()
 
+    _sync_formatter_word_status(session, formatter)
+
     recited_text = ""
     harakaat_errors = None
+    word_errors = None
     if session.chunk_results:
         last = session.chunk_results[-1]
-        if last.matched_ayah == session.current_ayah:
-            recited_text = last.corrected_text or ""
+        # Same confidence gate as _build_expected_ayah_html() above — see
+        # its comment for why this is confidence-only, not verdict-based.
+        is_reliable = last.confidence is None or last.confidence >= CONFIDENCE_UNCERTAIN_THRESHOLD
+        if last.matched_ayah == session.current_ayah and is_reliable:
+            # Keep progress colours faithful to the recognized recitation,
+            # not the post-correction transcript (same rule as the expected
+            # ayah display above).
+            recited_text = last.raw_asr or ""
             harakaat_errors = last.harakaat_errors
+            word_errors = last.word_errors
 
     return formatter.format_surah_progress_html(
         session.surah,
@@ -824,10 +883,11 @@ def _build_surah_progress_html(session, formatter, qari_mode: bool) -> str:
         session.current_ayah,
         recited_text,
         harakaat_errors=harakaat_errors,
+        word_errors=word_errors,
     )
 
 
-def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="http://127.0.0.1:8000"):
+def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="https://api.syedalihashmi.dev"):
     """Called by Gradio's streaming mic with each audio fragment.
 
     audio_data is a tuple (sample_rate, numpy_array) from Gradio.
@@ -992,35 +1052,38 @@ def process_streaming_audio(audio_data, correction_mode, qari_mode, asr_engine, 
 
 
 def _build_chunks_table(session):
-    """Build the HTML table of chunk results for the given session."""
-    def _audio_src(path: str) -> str:
-        if not path or not os.path.isfile(path):
-            return ""
+    """Build the ASR-chunk table and, once finalized, one continuous player.
 
-        cache = getattr(session, "_chunk_audio_cache", None)
-        if cache is None:
-            cache = {}
-            session._chunk_audio_cache = cache
-
-        cached = cache.get(path)
-        if cached:
-            return cached
-
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            b64 = base64.b64encode(data).decode("ascii")
-            src = f"data:audio/wav;base64,{b64}"
-        except Exception:
-            normalized = path.replace("\\", "/")
-            src = f"/file={quote(normalized)}"
-
-        cache[path] = src
-        return src
+    VAD chunks are deliberately speech-only and receive analysis-time audio
+    processing.  They are unsuitable as a recording playlist: concatenating
+    them removes real pauses and makes the joins sound clipped.  The single
+    session WAV is the unmodified timeline used for listening instead.
+    """
+    session_wav = getattr(session, "session_wav_path", "")
+    if session_wav and os.path.isfile(session_wav):
+        normalized = session_wav.replace("\\", "/")
+        session_src = f"/file={quote(normalized)}"
+        player_html = (
+            "<div class='session-audio-player' style='margin:0 0 12px; padding:10px; "
+            "border:1px solid rgba(120,190,150,.35); border-radius:8px;'>"
+            "<div style='margin-bottom:6px'><b>Full recording (continuous)</b> "
+            "<span style='opacity:.75'>— original timing and pauses preserved</span></div>"
+            f"<audio controls preload='metadata' src='{session_src}'></audio>"
+            "</div>"
+        )
+        segment_label = "ASR segment"
+    else:
+        player_html = (
+            "<div class='session-audio-player' style='margin:0 0 12px; opacity:.75'>"
+            "Full continuous recording will be available here after you stop the session."
+            "</div>"
+        )
+        segment_label = "ASR-only"
 
     rows = [
+        player_html,
         "<table class='chunk-table'>",
-        "<thead><tr><th>Audio</th><th>#</th><th>Time Range</th><th>Raw ASR</th>"
+        "<thead><tr><th>Type</th><th>#</th><th>Time Range</th><th>Raw ASR</th>"
         "<th>Corrected</th><th>Confidence</th><th>Verdict</th></tr></thead>",
         "<tbody>",
     ]
@@ -1029,14 +1092,9 @@ def _build_chunks_table(session):
         corr_short = (r.corrected_text[:40] + "...") if len(r.corrected_text) > 40 else r.corrected_text
         conf_str = f"{r.confidence:.2f}" if r.confidence is not None else "-"
         time_range = f"{r.start_time_s:.1f}-{r.end_time_s:.1f}s"
-        src = _audio_src(r.chunk_wav_path)
-        if src:
-            audio_html = f"<audio controls preload='metadata' src='{src}'></audio>"
-        else:
-            audio_html = "-"
         rows.append(
             "<tr>"
-            f"<td>{audio_html}</td>"
+            f"<td>{segment_label}</td>"
             f"<td>{r.chunk_index}</td>"
             f"<td>{time_range}</td>"
             f"<td>{raw_short}</td>"
@@ -1049,7 +1107,7 @@ def _build_chunks_table(session):
         time_range = f"{p['start_time_s']:.1f}-{p['end_time_s']:.1f}s"
         rows.append(
             "<tr>"
-            "<td>-</td>"
+            "<td>ASR-only</td>"
             f"<td>{p['chunk_index']}</td>"
             f"<td>{time_range}</td>"
             "<td>Processing...</td>"
@@ -1089,7 +1147,7 @@ def _build_live_ui_snapshot(session):
     return expected_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed, badge_html
 
 
-def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="http://127.0.0.1:8000"):
+def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=False, api_base_url="https://api.syedalihashmi.dev"):
     """Drain the queue (yielding updates), then return all 9 UI outputs with full results."""
     global _active_session
 
@@ -1138,6 +1196,13 @@ def stop_live_session(correction_mode, qari_mode, asr_engine, use_api_combined=F
 
         # ---- 4. Finalize (saves WAVs + JSON) ----
         results_path = session.finalize()
+
+        # Rebuild after finalize so the table swaps its ASR-only VAD clips for
+        # the one continuous session_full.wav player.  Rebuilding before this
+        # point would only show the live-session placeholder because the WAV
+        # does not exist until finalize() writes it.
+        merged_html, progress_html, error_html, all_raw, all_corrected, chunks_table, guessed, badge_html = \
+            _build_live_ui_snapshot(session)
 
         # ---- 5. Build session summary from chunk-by-chunk results only ----
         detected_surah = session.get_detected_surah()
@@ -1402,7 +1467,7 @@ with gr.Blocks(title="Hafizify — Quran ASR") as app:
                     visible=False,
                 )
                 api_base_url_input = gr.Textbox(
-                    value="http://127.0.0.1:8000",
+                    value="https://api.syedalihashmi.dev",
                     label="API Base URL",
                     info="Used when Active Tajweed Detection is on (Combined Mode via remote API).",
                 )

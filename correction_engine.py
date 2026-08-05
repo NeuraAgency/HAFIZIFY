@@ -36,6 +36,7 @@ def _words_close(a: str, b: str) -> bool:
         return _rfuzz_ce.ratio(a, b) >= 72.0
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
 
+
 class CorrectionEngine:
     def __init__(self, on_state_change=None):
         self.state = "LISTENING"  # LISTENING, CORRECTING, VERIFYING
@@ -199,13 +200,16 @@ class CorrectionEngine:
 
         elif verdict == "error":
             self.total_errors += 1
-
             # Ignore low-confidence/garbled chunks — not a real recitation mistake
             if confidence < self._min_trigger_confidence:
                 self._notify("LISTENING")
                 return {"action": "warn", "state": "LISTENING",
                         "message": f"خطأ محتمل"}
 
+            self._pending_corrections = self._build_pending_corrections(
+                wrong_words or [],
+                correction_spans or [],
+            )
             self.correction_attempts = 0
             self._correction_id += 1
             correction_id = self._correction_id
@@ -213,10 +217,6 @@ class CorrectionEngine:
             self._correction_kind = "word"
             self._notify("CORRECTING")
 
-            self._pending_corrections = self._build_pending_corrections(
-                wrong_words or [],
-                correction_spans or [],
-            )
             self._pending_wrong_words = [c["text"] for c in self._pending_corrections if c.get("text")]
             
             self.error_history.append({
@@ -382,13 +382,6 @@ class CorrectionEngine:
         ayah, not the predicted text — see WordAnnotation.ref_index in
         harakaat_error_detector.py) to select the right audio segment.
         """
-        self.correction_attempts = 0
-        self._correction_id += 1
-        correction_id = self._correction_id
-        self.state = "CORRECTING"
-        self._correction_kind = "harakaat"
-        self._notify("CORRECTING")
-
         corrections = []
         for h in harakaat_errors:
             ref_word = h.get("reference") or h.get("predicted")
@@ -402,6 +395,13 @@ class CorrectionEngine:
                 "ref_word_start": ref_idx,
                 "ref_word_end": ref_idx,
             })
+        self.correction_attempts = 0
+        self._correction_id += 1
+        correction_id = self._correction_id
+        self.state = "CORRECTING"
+        self._correction_kind = "harakaat"
+        self._notify("CORRECTING")
+
         self._pending_corrections = corrections
         self._pending_wrong_words = [c["text"] for c in corrections]
         self._pending_harakaat_ref_words = {normalize_arabic(c["text"]) for c in corrections}
@@ -442,11 +442,16 @@ class CorrectionEngine:
     # ─── Helpers ───────────────────────────────────────────
     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):
         try:
+            spoken = set()
             for correction in corrections:
-                if not self._play_quran_correction(correction):
-                    word = correction.get("text", "")
-                    if word:
-                        self.speak(word)
+                word = str(correction.get("text") or "").strip()
+                # Use one playback mechanism only. Quran-audio responses can
+                # lack word timings and replay a whole ayah for every error;
+                # Edge TTS always says only the intended reference word.
+                word_key = normalize_arabic(word)
+                if word and word_key and word_key not in spoken:
+                    spoken.add(word_key)
+                    self.speak(word)
         except Exception as exc:
             print(f"[CorrectionEngine] Correction audio failed, continuing silently: {exc}")
 

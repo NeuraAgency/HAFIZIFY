@@ -1,0 +1,628 @@
+﻿diff --git a/correction_engine.py b/correction_engine.py
+index 90035c4..611db84 100644
+--- a/correction_engine.py
++++ b/correction_engine.py
+@@ -36,10 +36,13 @@ def _words_close(a: str, b: str) -> bool:
+         return _rfuzz_ce.ratio(a, b) >= 72.0
+     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
+ 
++
+ class CorrectionEngine:
+     def __init__(self, on_state_change=None):
+         self.state = "LISTENING"  # LISTENING, CORRECTING, VERIFYING
+-        self._min_trigger_confidence = 0.30  # ignore low-confidence/garbled chunks — not a real mistake
++        # Avoid interrupting or scoring a reciter from a weak ASR hypothesis.
++        # Around 0.30, remote combined chunks are commonly overlap/noise.
++        self._min_trigger_confidence = 0.50
+         self.current_ayah = None
+         self.current_surah = None
+         self.correction_attempts = 0
+@@ -69,6 +72,18 @@ class CorrectionEngine:
+         # independent set so the two verification paths can't interfere with
+         # each other even though both may be "pending" in some form.
+         self._pending_harakaat_ref_words: set = set()
++        # Per-ayah set of reference word indices already confirmed correct by
++        # a fresh word_errors annotation. The word-scoring pass that feeds
++        # wrong_words/correction_spans is recomputed from scratch every
++        # chunk with zero memory of its own -- without this, a word marked
++        # correct one chunk could get swept back into a "wrong" phrase on a
++        # later chunk purely from an ASR wobble on an unrelated word, even
++        # though nothing about that specific word changed. This is what the
++        # live display's sticky green already guarantees on-screen; this
++        # gives the TTS/correction trigger the same guarantee so the two
++        # never disagree about a word that's already been confirmed.
++        # Keyed by (surah, ayah); naturally cleared by reset()/new session.
++        self._resolved_ref_indices: dict = {}
+         self._state_lock = threading.RLock()
+         self._correction_id = 0
+         
+@@ -143,6 +158,7 @@ class CorrectionEngine:
+         correction_spans: list[dict] | None = None,
+         confidence: float = 1.0,
+         harakaat_errors: list | None = None,
++        word_errors: list | None = None,
+     ) -> dict:
+         """
+         Call this after every chunk is processed.
+@@ -152,11 +168,60 @@ class CorrectionEngine:
+         populated by Combined Mode chunks. When None (standard mode, or a
+         Combined Mode chunk with no vowel slips), behavior here is 100%
+         unchanged from before this param existed.
++
++        word_errors: this chunk's full per-word annotation list (whatever
++        already lands in guard_result["word_errors"] — every caller already
++        computes this for the Chunk Details table, so passing it through
++        here is free). Used only to update _resolved_ref_indices so a word
++        already shown correct never gets re-corrected later; does not change
++        any other behavior when omitted.
+         """
+         with self._state_lock:
+             self.current_ayah = ayah_num
+             self.current_surah = surah_num
+ 
++            # Usually harakaat_errors is present as its own API field.  This
++            # fallback also supports servers that express it only through the
++            # per-word status field.
++            if not harakaat_errors:
++                harakaat_errors = [
++                    {
++                        "reference": annotation.get("reference"),
++                        "predicted": annotation.get("word"),
++                        "ref_index": annotation.get("ref_index"),
++                    }
++                    for annotation in (word_errors or [])
++                    if str(annotation.get("status") or "").lower()
++                    in ("harakaat_error", "harakaat")
++                ]
++
++            # A harakaat detector may flag a word which consonant-only word
++            # scoring labels "correct".  Do not let that label resolve the
++            # word before its vowel correction has been spoken and verified.
++            harakaat_ref_indexes = {
++                int(error["ref_index"])
++                for error in (harakaat_errors or [])
++                if error.get("ref_index") is not None
++                and str(error.get("ref_index")).lstrip("-").isdigit()
++            }
++            self._note_resolved_words(word_errors, exclude_ref_indexes=harakaat_ref_indexes)
++
++            # The backend annotation is the only word-error authority. A
++            # client must not promote uncertain/minor/missing results into a
++            # recitation error; only explicit "major" starts word TTS.
++            if word_errors is not None:
++                resolved = self._resolved_ref_indices.get(
++                    (self.current_surah, self.current_ayah), set()
++                )
++                actionable_word_error = any(
++                    str(annotation.get("status") or "").lower()
++                    == "major"
++                    and annotation.get("ref_index") is not None
++                    and int(annotation["ref_index"]) not in resolved
++                    for annotation in word_errors
++                )
++                verdict = "error" if actionable_word_error else "ok"
++
+             if self.state == "LISTENING":
+                 return self._handle_listening(
+                     verdict, raw_asr, correct_ayah_text, wrong_words, correction_spans,
+@@ -182,30 +247,47 @@ class CorrectionEngine:
+         confidence: float = 1.0,
+         harakaat_errors: list | None = None,
+     ) -> dict:
++        # A vowel-only annotation is actionable independently of the broad
++        # chunk verdict.  Some API versions report that chunk as "error",
++        # while others report "ok" because consonants match; both must play
++        # the correct word.
++        if harakaat_errors:
++            return self._handle_harakaat_error(harakaat_errors)
++
+         if verdict == "ok":
+             self.total_ok += 1
+-            if harakaat_errors:
+-                return self._handle_harakaat_error(harakaat_errors)
+             self._notify("LISTENING")
+             return {"action": "continue", "state": "LISTENING"}
+ 
+         elif verdict == "minor":
+             self.total_minor += 1
+-            if harakaat_errors:
+-                return self._handle_harakaat_error(harakaat_errors)
+             self._notify("LISTENING")
+             return {"action": "warn", "state": "LISTENING",
+                     "message": "تحسين بسيط مطلوب"}
+ 
+         elif verdict == "error":
+-            self.total_errors += 1
+-
+             # Ignore low-confidence/garbled chunks — not a real recitation mistake
+             if confidence < self._min_trigger_confidence:
+                 self._notify("LISTENING")
+                 return {"action": "warn", "state": "LISTENING",
+                         "message": f"خطأ محتمل"}
+ 
++            pending = self._build_pending_corrections(
++                wrong_words or [],
++                correction_spans or [],
++            )
++            pending = self._filter_already_resolved(pending)
++            if not pending:
++                # Every word flagged this chunk was already confirmed correct
++                # (stale wrong_words from a since-fixed word) — nothing left
++                # to teach, don't interrupt the reciter for it.
++                self._notify("LISTENING")
++                return {"action": "continue", "state": "LISTENING"}
++
++            # Only a high-confidence, actionable correction counts as an
++            # error. Noise, overlap fragments and already-green words do not
++            # affect session accuracy.
++            self.total_errors += 1
+             self.correction_attempts = 0
+             self._correction_id += 1
+             correction_id = self._correction_id
+@@ -213,10 +295,7 @@ class CorrectionEngine:
+             self._correction_kind = "word"
+             self._notify("CORRECTING")
+ 
+-            self._pending_corrections = self._build_pending_corrections(
+-                wrong_words or [],
+-                correction_spans or [],
+-            )
++            self._pending_corrections = pending
+             self._pending_wrong_words = [c["text"] for c in self._pending_corrections if c.get("text")]
+             
+             self.error_history.append({
+@@ -382,13 +461,6 @@ class CorrectionEngine:
+         ayah, not the predicted text — see WordAnnotation.ref_index in
+         harakaat_error_detector.py) to select the right audio segment.
+         """
+-        self.correction_attempts = 0
+-        self._correction_id += 1
+-        correction_id = self._correction_id
+-        self.state = "CORRECTING"
+-        self._correction_kind = "harakaat"
+-        self._notify("CORRECTING")
+-
+         corrections = []
+         for h in harakaat_errors:
+             ref_word = h.get("reference") or h.get("predicted")
+@@ -402,6 +474,20 @@ class CorrectionEngine:
+                 "ref_word_start": ref_idx,
+                 "ref_word_end": ref_idx,
+             })
++        corrections = self._filter_already_resolved(corrections)
++        if not corrections:
++            # Already confirmed correct since this hint was raised — don't
++            # interrupt the reciter for a word that's already fixed.
++            self._notify("LISTENING")
++            return {"action": "continue", "state": "LISTENING"}
++
++        self.correction_attempts = 0
++        self._correction_id += 1
++        correction_id = self._correction_id
++        self.state = "CORRECTING"
++        self._correction_kind = "harakaat"
++        self._notify("CORRECTING")
++
+         self._pending_corrections = corrections
+         self._pending_wrong_words = [c["text"] for c in corrections]
+         self._pending_harakaat_ref_words = {normalize_arabic(c["text"]) for c in corrections}
+@@ -442,11 +528,16 @@ class CorrectionEngine:
+     # ─── Helpers ───────────────────────────────────────────
+     def _speak_words_and_verify(self, corrections: list[dict], correction_id: int):
+         try:
++            spoken = set()
+             for correction in corrections:
+-                if not self._play_quran_correction(correction):
+-                    word = correction.get("text", "")
+-                    if word:
+-                        self.speak(word)
++                word = str(correction.get("text") or "").strip()
++                # Use one playback mechanism only. Quran-audio responses can
++                # lack word timings and replay a whole ayah for every error;
++                # Edge TTS always says only the intended reference word.
++                word_key = normalize_arabic(word)
++                if word and word_key and word_key not in spoken:
++                    spoken.add(word_key)
++                    self.speak(word)
+         except Exception as exc:
+             print(f"[CorrectionEngine] Correction audio failed, continuing silently: {exc}")
+ 
+@@ -460,6 +551,47 @@ class CorrectionEngine:
+             self.state = "VERIFYING"
+             self._notify("VERIFYING")
+ 
++    def _note_resolved_words(
++        self,
++        word_errors: list | None,
++        exclude_ref_indexes: set | None = None,
++    ):
++        """Record every ref_index this chunk's fresh word_errors annotation
++        calls "correct" as permanently resolved for the current ayah — see
++        _resolved_ref_indices docstring in __init__."""
++        if not word_errors or self.current_surah is None or self.current_ayah is None:
++            return
++        key = (self.current_surah, self.current_ayah)
++        resolved = self._resolved_ref_indices.setdefault(key, set())
++        excluded = exclude_ref_indexes or set()
++        for ann in word_errors:
++            if (
++                ann.get("status") == "correct"
++                and ann.get("ref_index") is not None
++                and int(ann["ref_index"]) not in excluded
++            ):
++                resolved.add(int(ann["ref_index"]))
++
++    def _filter_already_resolved(self, corrections: list[dict]) -> list[dict]:
++        """Drop any pending single-word correction whose word has already
++        been confirmed correct this ayah — see _resolved_ref_indices
++        docstring in __init__. Only ever filters single-word corrections
++        (ref_word_start == ref_word_end), which is now the only kind that
++        exists after _wrong_words_and_spans_from_word_errors() stopped
++        grouping consecutive words into multi-word phrases."""
++        key = (self.current_surah, self.current_ayah)
++        resolved = self._resolved_ref_indices.get(key)
++        if not resolved:
++            return corrections
++        return [
++            c for c in corrections
++            if not (
++                c.get("ref_word_start") is not None
++                and c.get("ref_word_start") == c.get("ref_word_end")
++                and int(c["ref_word_start"]) in resolved
++            )
++        ]
++
+     def _build_pending_corrections(self, wrong_words: list, correction_spans: list[dict]) -> list[dict]:
+         corrections: list[dict] = []
+         max_len = max(len(wrong_words), len(correction_spans)) if (wrong_words or correction_spans) else 0
+diff --git a/live_display_formatter.py b/live_display_formatter.py
+index 3c5baeb..8dc9c93 100644
+--- a/live_display_formatter.py
++++ b/live_display_formatter.py
+@@ -219,6 +219,7 @@ class LiveDisplayFormatter:
+         ref_words: List[str],
+         recited_words: List[str],
+         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
++        word_errors: Optional[List[Dict[str, Any]]] = None,
+     ) -> List[str]:
+         """Diff this chunk's recited words against the full ayah reference
+         and merge the result into the persistent status for (surah, ayah).
+@@ -234,6 +235,66 @@ class LiveDisplayFormatter:
+         - Words this chunk doesn't touch keep whatever status they already had.
+         """
+         status = self._get_word_status(surah, ayah, ref_words)
++
++        # The API already returns the authoritative word-by-word alignment.
++        # Prefer it over a second local SequenceMatcher pass: re-aligning
++        # stripped text loses the backend's harakaat/uncertain classifications
++        # and is the reason the Gradio chips could disagree with /transcribe.
++        # A confirmed correct word is intentionally immutable for this live
++        # session; later noisy chunks may never turn a green chip red/gold.
++        if word_errors is not None:
++            harakaat_ref_indexes = {
++                int(error["ref_index"])
++                for error in (harakaat_errors or [])
++                if error.get("ref_index") is not None
++                and str(error.get("ref_index")).lstrip("-").isdigit()
++            }
++            # Explicit backend harakaat errors are the sole gold signal.
++            # Missing diacritics are not in this list and are intentionally
++            # ignored.
++            for ref_index in harakaat_ref_indexes:
++                if 0 <= ref_index < len(status) and status[ref_index] != "correct":
++                    status[ref_index] = "harakaat"
++            for annotation in word_errors:
++                ref_index = annotation.get("ref_index")
++                if ref_index is None:
++                    continue
++                try:
++                    ref_index = int(ref_index)
++                except (TypeError, ValueError):
++                    continue
++                if not 0 <= ref_index < len(status) or status[ref_index] == "correct":
++                    continue
++
++                label = str(annotation.get("status") or "").lower()
++                if label == "correct":
++                    status[ref_index] = (
++                        "harakaat" if ref_index in harakaat_ref_indexes else "correct"
++                    )
++                elif label in ("harakaat_error", "harakaat"):
++                    status[ref_index] = "harakaat"
++                elif label == "minor":
++                    status[ref_index] = "minor"
++                elif label == "uncertain":
++                    # The API may be uncertain because its two ASR engines
++                    # disagree even when the word is an 80%+ close match.
++                    # Treat that as correct for the live display only.
++                    try:
++                        similarity = float(annotation.get("similarity", 0.0))
++                    except (TypeError, ValueError):
++                        similarity = 0.0
++                    if similarity >= 0.80:
++                        status[ref_index] = "correct"
++                    elif status[ref_index] == "wrong":
++                        # Remove a stale red chip when the backend no longer
++                        # calls this reference word an actual error.
++                        status[ref_index] = "pending"
++                elif label == "major":
++                    # Do not invent errors from uncertain/minor/missing/extra
++                    # API statuses. Only the explicit major status is red.
++                    status[ref_index] = "wrong"
++            return status
++
+         if not recited_words:
+             return status
+ 
+@@ -267,14 +328,15 @@ class LiveDisplayFormatter:
+         for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
+             if tag == "equal":
+                 for j in range(j1, j2):
+-                    status[j] = "harakaat" if ref_norm[j] in harakaat_norm_words else "correct"
++                    if status[j] != "correct":
++                        status[j] = "harakaat" if ref_norm[j] in harakaat_norm_words else "correct"
+             elif tag == "replace":
+                 rec_slice = rec_norm[_i1:_i2]
+                 ref_slice = ref_norm[j1:j2]
+                 shared = min(len(rec_slice), len(ref_slice))
+                 for offset in range(shared):
+                     j = j1 + offset
+-                    if status[j] in ("correct", "harakaat"):
++                    if status[j] == "correct":
+                         continue
+                     sim = _char_similarity(rec_slice[offset], ref_slice[offset])
+                     status[j] = "correct" if sim >= _WORD_MATCH_THRESHOLD else "wrong"
+@@ -287,21 +349,24 @@ class LiveDisplayFormatter:
+ 
+     @staticmethod
+     def _render_qari_aligned(ref_words: List[str], status: List[str]) -> List[str]:
+-        """Render word spans with qari-style sequential gating: once a word
+-        is wrong, no later word may show green/gold until that specific word
+-        is fixed (its status flips back to "correct"/"harakaat"). Later words
+-        show red (if actually wrong) or gray (if correct but not yet
+-        credited)."""
+-        frontier = next((i for i, s in enumerate(status) if s == "wrong"), None)
++        """Render each reference word from its own observed status.
++
++        A previous implementation applied a sequential "frontier": after the
++        first wrong word, every later correctly-recognised word was forced
++        gray.  That made the display look as if most of the ayah had not been
++        heard (as in the reported screenshot), even when the ASR had matched
++        those words.  Gray now means only "not yet observed"; green, gold and
++        red always describe that specific word.
++        """
+         spans: List[str] = []
+         for idx, word in enumerate(ref_words):
+             s = status[idx] if idx < len(status) else "pending"
+-            if frontier is not None and idx >= frontier and s in ("correct", "harakaat"):
+-                color = COLORS["pending"]
+-            elif s == "correct":
++            if s == "correct":
+                 color = COLORS["correct"]
+             elif s == "harakaat":
+                 color = COLORS["harakaat"]
++            elif s == "minor":
++                color = COLORS["minor"]
+             elif s == "wrong":
+                 color = COLORS["major"]
+             else:
+@@ -320,6 +385,7 @@ class LiveDisplayFormatter:
+         current_ayah: int,
+         recited_text: str,
+         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
++        word_errors: Optional[List[Dict[str, Any]]] = None,
+     ) -> str:
+         if surah is None:
+             return self._placeholder_html("Select a surah to view progress.")
+@@ -337,15 +403,31 @@ class LiveDisplayFormatter:
+             if ayah_num < start_ayah:
+                 continue
+             if ayah_num < current_ayah:
+-                for idx in range(start_idx, end_idx + 1):
+-                    all_status[idx] = "correct"
++                # Bug fix (2026-08-05, per Hamza): this used to blanket-mark
++                # every word of any earlier ayah "correct" just because the
++                # session moved past it, ignoring whatever the real tracked
++                # per-word status (self._word_status) said — a word that was
++                # never actually verified could show green here. Now: use
++                # the real tracked status if this ayah was ever diffed at
++                # all; otherwise leave it "pending" (all_status's own
++                # default) rather than claiming correctness with nothing
++                # behind it.
++                tracked = self._word_status.get((int(surah), int(ayah_num)))
++                ayah_len = end_idx - start_idx + 1
++                if tracked and len(tracked) == ayah_len:
++                    for offset, idx in enumerate(range(start_idx, end_idx + 1)):
++                        all_status[idx] = tracked[offset]
+                 continue
+             if ayah_num > current_ayah:
+                 continue
+ 
+             ref_words = raw_words[start_idx:end_idx + 1]
+             rec_words = _safe_text(recited_text).split() if recited_text else []
+-            status = self._update_word_status(surah, ayah_num, ref_words, rec_words, harakaat_errors=harakaat_errors)
++            status = self._update_word_status(
++                surah, ayah_num, ref_words, rec_words,
++                harakaat_errors=harakaat_errors,
++                word_errors=word_errors,
++            )
+             for offset, idx in enumerate(range(start_idx, end_idx + 1)):
+                 all_status[idx] = status[offset]
+ 
+@@ -536,6 +618,7 @@ class LiveDisplayFormatter:
+         ayah: Optional[int],
+         recited_text: str,
+         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
++        word_errors: Optional[List[Dict[str, Any]]] = None,
+     ) -> str:
+         """Render the current ayah, word by word, green/red against the ASR
+         text. Always compares against the ACTUAL expected ayah (surah, ayah)
+@@ -553,7 +636,11 @@ class LiveDisplayFormatter:
+         recited_clean = self._strip_invocations(recited_text, include_basmala=include_basmala)
+         rec_words = _safe_text(recited_clean).split()
+ 
+-        status = self._update_word_status(surah, ayah, ref_words, rec_words, harakaat_errors=harakaat_errors)
++        status = self._update_word_status(
++            surah, ayah, ref_words, rec_words,
++            harakaat_errors=harakaat_errors,
++            word_errors=word_errors,
++        )
+         spans = self._render_qari_aligned(ref_words, status)
+ 
+         body = " ".join(spans)
+diff --git a/realtime_streamer.py b/realtime_streamer.py
+index f454825..40a809c 100644
+--- a/realtime_streamer.py
++++ b/realtime_streamer.py
+@@ -206,43 +206,22 @@ def _wrong_words_and_spans_from_word_errors(annotations: list) -> tuple:
+     if not annotations:
+         return wrong_words, correction_spans
+ 
+-    first_teachable_idx = next(
+-        (
+-            i
+-            for i, a in enumerate(annotations)
+-            if a.get("status") in ("major", "missing")
+-            and a.get("reference")
+-        ),
+-        None,
+-    )
+-    if first_teachable_idx is None:
+-        return wrong_words, correction_spans
+-
+-    phrase_parts = []
+-    phrase_start_idx = first_teachable_idx
+-    for i, ann in enumerate(annotations[first_teachable_idx:], first_teachable_idx):
+-        if i > first_teachable_idx and ann.get("status") == "correct":
+-            break
+-        status = ann.get("status")
+-        ref_word = ann.get("reference")
+-        if status in ("major", "missing") and ref_word:
+-            phrase_parts.append(ref_word)
++    # One backend annotation maps to one corrective word.  In particular,
++    # include uncertain results: the requested policy treats them as red and
++    # asks TTS to teach the matching reference word.
++    for ann in annotations:
++        if ann.get("status") != "major":
+             continue
+-        if status not in ("extra", "uncertain") and phrase_parts:
+-            wrong_words.append(" ".join(phrase_parts))
+-            correction_spans.append(
+-                _correction_span_from_annotations(annotations, phrase_start_idx, i - 1)
+-            )
+-            phrase_parts = []
+-    if phrase_parts:
+-        wrong_words.append(" ".join(phrase_parts))
+-        correction_spans.append(
+-            _correction_span_from_annotations(
+-                annotations,
+-                phrase_start_idx,
+-                min(len(annotations) - 1, phrase_start_idx + len(phrase_parts) - 1),
+-            )
+-        )
++        ref_word = str(ann.get("reference") or "").strip()
++        if not ref_word:
++            continue
++        ref_index = ann.get("ref_index")
++        wrong_words.append(ref_word)
++        correction_spans.append({
++            "text": ref_word,
++            "ref_word_start": ref_index,
++            "ref_word_end": ref_index,
++        })
+     return wrong_words, correction_spans
+ 
+ 
+@@ -1167,6 +1146,7 @@ class RealtimeStreamer:
+                 wrong_words=guard_result.get("wrong_words", []),
+                 correction_spans=guard_result.get("correction_spans", []),
+                 confidence=float(guard_result.get("confidence") or 1.0),
++                word_errors=guard_result.get("word_errors"),
+             )
+             if correction_result["action"] == "pause":
+                 self._vad_paused = True
+@@ -1232,12 +1212,6 @@ class RealtimeStreamer:
+         decode_time = time.time() - t0
+         detection_text = _strip_leading_invocations(raw_text, strip_basmala=True)
+ 
+-        # Per-engine terminal output — confirms both models are actually
+-        # running and lets you compare their raw outputs chunk by chunk.
+-        print(f"[Chunk-Combined] Groq:     {decode_result['groq_text']}")
+-        print(f"[Chunk-Combined] Local:    {decode_result['local_text']}")
+-        print(f"[Chunk-Combined] Combined: {decode_result['combined_text']}")
+-
+         # 2. Rolling-window surah detection — same mechanism as process_chunk
+         if not hasattr(session, "_detection_buffer"):
+             session._detection_buffer = []
+@@ -1385,6 +1359,16 @@ class RealtimeStreamer:
+         guard_result["_decode_time_s"] = round(decode_time, 3)
+         guard_result["_chunk_duration_s"] = round(chunk_duration, 2)
+ 
++        # Full per-chunk debug dump (per Hamza) — every stage of Combined
++        # Mode's output in one place: what each engine said, the best-of-
++        # both merge before/after harakaat injection, and both error lists.
++        print(f"[Chunk-Combined] Groq raw:        {decode_result['groq_text']}")
++        print(f"[Chunk-Combined] Local raw:       {decode_result['local_text']}")
++        print(f"[Chunk-Combined] Combined1 (best-of, no harakaat): {decode_result['combined1']}")
++        print(f"[Chunk-Combined] Combined (+ harakaat):            {raw_text}")
++        print(f"[Chunk-Combined] Harakaat errors ({guard_result.get('harakaat_error_count', 0)}): {guard_result.get('harakaat_errors', [])}")
++        print(f"[Chunk-Combined] Word errors: {guard_result.get('word_errors', [])}")
++
+         result = session.register_chunk_result(
+             chunk_audio, guard_result, None, lock_state,
+             chunk_start_sample=chunk_start_sample,
+@@ -1415,6 +1399,7 @@ class RealtimeStreamer:
+                 correction_spans=guard_result.get("correction_spans", []),
+                 confidence=float(guard_result.get("confidence") or 1.0),
+                 harakaat_errors=guard_result.get("harakaat_errors"),
++                word_errors=guard_result.get("word_errors"),
+             )
+             self._last_qari_action = correction_result
+             if correction_result["action"] == "pause":
+@@ -1434,7 +1419,7 @@ class RealtimeStreamer:
+         chunk_start_sample: int = None,
+         chunk_end_sample: int = None,
+         qari_mode: bool = False,
+-        api_base_url: str = "http://127.0.0.1:8000",
++        api_base_url: str = "https://api.syedalihashmi.dev",
+         model_choice: str = "groq-whisper-large-v3",
+     ) -> ChunkResult:
+         """Combined Mode via a remote api/main.py server's POST /transcribe,
+@@ -1554,13 +1539,28 @@ class RealtimeStreamer:
+             f"decode={decode_time:.2f}s | "
+             f"raw='{guard_result.get('raw_asr','')[:50]}' | "
+             f"verdict={result.verdict} | "
++            f"conf={guard_result.get('confidence')} | "
++            f"matched_ayah={guard_result.get('matched_ayah')} | "
++            f"cer={guard_result.get('cer')} wer={guard_result.get('wer')} | "
+             f"harakaat_errors={guard_result.get('harakaat_error_count', 0)} | "
+             f"surah={effective_surah} | api_ok={api_result is not None}"
+         )
++        if api_result is not None:
++            print(f"[Chunk-API {result.chunk_index}] Word errors: {guard_result.get('word_errors', [])}")
+ 
+         if qari_mode:
++            qari_verdict = guard_result.get("verdict", "unknown")
++            # CER/WER=0 is an exact ayah match. The remote endpoint has
++            # occasionally returned verdict="error" alongside these values;
++            # do not pause the reciter for that contradictory aggregate flag.
++            if (
++                not guard_result.get("harakaat_errors")
++                and guard_result.get("cer") == 0
++                and guard_result.get("wer") == 0
++            ):
++                qari_verdict = "ok"
+             correction_result = self.correction_engine.process_verdict(
+-                verdict=guard_result.get("verdict", "unknown"),
++                verdict=qari_verdict,
+                 raw_asr=guard_result.get("raw_asr", ""),
+                 correct_ayah_text=guard_result.get("matched_ayah_text", ""),
+                 ayah_num=guard_result.get("matched_ayah"),
+@@ -1569,6 +1569,7 @@ class RealtimeStreamer:
+                 correction_spans=guard_result.get("correction_spans", []),
+                 confidence=float(guard_result.get("confidence") or 1.0),
+                 harakaat_errors=guard_result.get("harakaat_errors"),
++                word_errors=guard_result.get("word_errors"),
+             )
+             self._last_qari_action = correction_result
+             if correction_result["action"] == "pause":

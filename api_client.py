@@ -15,7 +15,7 @@ Usage
         surah=1, expected_ayah=1,
         correction_mode="balanced", asr_engine="combined",
         model_choice="groq-whisper-large-v3",
-        api_base_url="http://127.0.0.1:8000",
+        api_base_url="https://api.syedalihashmi.dev",
     )
     # result is a dict matching api/main.py's /transcribe JSON response,
     # or None if the request failed (server down, timeout, non-2xx, etc.)
@@ -34,9 +34,10 @@ except ImportError:
     httpx = None
     _HAS_HTTPX = False
 
-# Matches app.py's default Advanced Settings value and api/main.py's own
-# default bind address (uvicorn api.main:app --host 0.0.0.0 --port 8000).
-_DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
+# Matches app.py's default Advanced Settings value. Deployed API server
+# (2026-08-05, Claude/chat, per Hamza) -- was http://127.0.0.1:8000
+# (uvicorn's local default bind address) during local dev/testing.
+_DEFAULT_API_BASE_URL = "https://api.syedalihashmi.dev"
 _DEFAULT_TIMEOUT_S = 120.0  # TEMP: bumped from 45s so a single chunk can be
                             # seen through end-to-end on CPU-only hardware
                             # (both app.py and uvicorn sharing the same 6

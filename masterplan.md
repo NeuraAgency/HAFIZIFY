@@ -568,3 +568,214 @@ Not done: didn't touch `requirements.txt` (desktop venv) or suggest
 uninstalling kenlm from it — harmless to leave installed now that nothing
 touches it at startup, and `hybrid_pipeline.py` already degrades
 gracefully via `_KENLM_AVAILABLE` if it's ever removed.
+
+**2026-08-03 — Remote API option for Combined Mode (Claude, chat), per
+Hamza, after he confirmed via a live Postman test that `api/main.py`'s
+`POST /transcribe` (`asr_engine=combined`) returns a fully-processed result
+(`raw_asr`, `corrected_text`, `matched_ayah`, `matched_ayah_text`,
+`confidence`, `verdict`, `cer`, `wer`, `harakaat_errors`,
+`harakaat_error_count`, `word_errors`) end to end, not just a raw decode.
+Ask: let `app.py` optionally send Combined Mode chunks to a running
+`api/main.py` server over HTTP instead of loading Groq + the 1.51 GB local
+turbo model into the Gradio process directly. Standard Mode (local
+tarteel-ai-based `whisper-base-quran-lora`, `process_chunk()`) untouched
+either way.
+
+Bug found and already fixed by something else before I got to it while
+investigating: `app.py`'s `_build_expected_ayah_html()`/
+`_build_surah_progress_html()` were already calling `formatter.format_
+expected_ayah_html(..., harakaat_errors=...)`/`format_surah_progress_html(
+..., harakaat_errors=...)`, but the `live_display_formatter.py` I'd edited
+earlier in Phase 6 had neither method accepting that kwarg — a `TypeError`
+on every Live-tab streaming callback. Re-read the file fresh before writing
+a fix (per "read before writing") and found it had already been rewritten,
+outside this conversation, with a more thorough fix (harakaat threaded
+through as a sticky third word-status alongside correct/wrong, plus an
+unrelated pill/chip UI restyle) than what I was about to write. No edit
+made there — noted so a future session doesn't re-diagnose the same
+symptom from a stale copy.
+
+Built:
+1. New file `api_client.py` — `transcribe_via_api()`: writes the chunk to
+   an in-memory WAV via stdlib `wave` (same technique `groq_transcriber.py`
+   already uses), POSTs multipart to `{api_base_url}/transcribe` via
+   `httpx` (already a transitive dep through `groq`, now also pinned
+   directly in `requirements.txt` since this module imports it itself).
+   Returns parsed JSON or `None` on any failure — never raises.
+2. `realtime_streamer.py` — extracted the phrase-grouping logic that turns
+   word-error annotations into `wrong_words`/`correction_spans` out of
+   `_apply_qari_word_scoring()` into a shared `_wrong_words_and_spans_from_
+   word_errors()` (refactors my own earlier addition, not `process_chunk()`'s
+   body — §5's "do not touch" list still holds). New sibling function
+   `process_chunk_api()`: same shape as `process_chunk_combined()`, calls
+   `transcribe_via_api()`, maps the JSON onto the same `guard_result` shape,
+   then reuses the exact same `session.register_chunk_result()` /
+   `self.correction_engine.process_verdict()` calls — which is why Qari
+   Mode, TTS, and the live display's harakaat highlight all work here with
+   zero further changes: they only ever read that shared dict shape, never
+   care which pipeline produced it. On API failure, degrades to a harmless
+   low-confidence `"error"`-verdict result instead of crashing or silently
+   attempting a local Groq/turbo-model fallback the machine may not have
+   installed. Known limitation (documented in the function's own
+   docstring): no local rolling-window surah detection on this path — each
+   `ChunkResult.surah_lock_state` just carries forward the session's last
+   known lock state, since the stateless `/transcribe` endpoint has no
+   equivalent. Works well once a surah is already selected/locked; a pure
+   "Auto (Detect)" session is better served by local Combined Mode for now.
+3. `app.py` — two new Advanced-Settings controls (`use_api_combined_checkbox`,
+   `api_base_url_input`, default `http://127.0.0.1:8000`).
+   `_process_queue_worker()`'s task-tuple unpacking now also accepts a
+   7-element shape, falling back to old defaults for any shorter tuple
+   already in flight; dispatches to `process_chunk_api()` only when
+   `asr_engine == "combined" and use_api_combined`. `process_streaming_
+   audio()`/`stop_live_session()` both gained the two params (safe
+   defaults, so any other caller is unaffected).
+
+Not done: no `/health`-driven auto-disable of the toggle when the API
+server isn't reachable (added later — see the 2026-08-04 entry below). No
+live end-to-end test against a real running server + mic session in this
+round; Hamza's Postman test only confirmed the endpoint standalone.
+
+**2026-08-04 — `/health` reachability check added to `start_live_session()`
+(Claude, chat), closing the "not done" item above.** When Combined Mode via
+the remote API is selected, `start_live_session()` now calls `GET
+{api_base_url}/health` (few-second timeout) before creating the session. On
+failure, returns a visible red error panel explaining the URL and how to
+fix it (start the server, check the URL/ngrok rotation, or turn off Active
+Tajweed Detection) instead of letting the reciter start talking into a dead
+pipe and only discovering the problem after `api_client.py`'s full 120s
+timeout on the first chunk. Standard Mode and local Combined Mode never
+call this — skipped entirely for them.
+
+Also around this time: the UI was simplified to a single "Active Tajweed
+Detection" checkbox (replacing the separate ASR-engine radio +
+use-API checkbox as the primary control) that drives `live_asr_engine_
+selector` via a `.change()` handler, with `api_base_url_input` promoted out
+of the Advanced Settings accordion into always-visible. `use_api_combined`
+is effectively always true whenever Combined Mode is on now (the old
+"local Combined Mode" path via `process_chunk_combined()` still exists and
+is still reachable by construction, just no longer has a dedicated UI
+toggle distinct from the API path) — noting this so a future session
+understands why `active_tajweed_checkbox` maps to both the engine radio AND
+the API-mode flag in the same `.change()`/inputs wiring.
+
+**2026-08-05 — Harakaat errors now trigger the full CORRECTING/VERIFYING
+interrupt, replacing HARAKAAT_HINT (Claude, chat), per Hamza: "I want it in
+my Harakaat error too" (referring to the full pause-play-verify flow word
+errors already get).**
+
+The old `HARAKAAT_HINT` sub-state (§4.4/Phase 5) played a short audio cue
+and returned straight to `LISTENING` — no pause, no verification. Hamza
+wanted the same interrupt word errors get: mic pauses, correct audio
+plays, waits for a verified fix. Real complication: the existing
+verification check (`consume_pending_match()`) runs after
+`normalize_arabic()`, which strips all diacritics — reusing it as-is would
+report "fixed" the instant the reciter repeats the same consonants,
+regardless of whether the vowel is now right (it was already
+consonant-correct before the correction even started — that's what made
+it a harakaat error and not a word error).
+
+Fixes made:
+1. `harakaat_error_detector.py` — added `ref_index: Optional[int] = None`
+   to `WordAnnotation`, populated in the `"equal"`-tag branch (the only
+   place `harakaat_error` is ever assigned). The existing `index` field is
+   the *predicted*-text word position; audio-segment lookup for correction
+   playback needs the *reference*-ayah word position instead, which can
+   differ after an insert/delete elsewhere in the alignment.
+2. `realtime_streamer.py` / `api/main.py` — both `harakaat_errors`
+   dict-building sites (`process_chunk_combined()`'s step 4, and
+   `/transcribe`'s combined branch) now include `"ref_index": w.ref_index`
+   alongside the existing fields.
+3. `correction_engine.py` — added `self._correction_kind` (`"word"` |
+   `"harakaat"`) and `self._pending_harakaat_ref_words` (a set,
+   deliberately untouched by `consume_pending_match()` so the two
+   verification paths can't interfere with each other). `_handle_listening()`'s
+   two `harakaat_errors` branches now call a new `_handle_harakaat_error()`
+   instead of the removed `_handle_harakaat_hint()`: same full CORRECTING
+   flow as a word error (mic pauses, plays the real Quran audio for the
+   flagged word via `ref_index`, transitions to VERIFYING), but sets
+   `_correction_kind = "harakaat"`. `_handle_verifying()` now dispatches to
+   a new `_handle_verifying_harakaat()` when in that mode: compares the
+   FRESH `harakaat_errors` computed for the new chunk (re-run every chunk
+   regardless of qari state) against the pending reference word(s) — fixed
+   only when the word no longer shows up as a harakaat_error at all, not
+   merely re-said. Added `is_harakaat_correction()` for callers to check.
+4. `realtime_streamer.py`'s `process_chunk_combined()` — during VERIFYING,
+   the existing diacritic-blind `consume_pending_match()` shortcut is now
+   skipped when `correction_engine.is_harakaat_correction()` is true,
+   falling through to the normal `_apply_qari_word_scoring()` branch
+   instead — needed so harakaat detection (step 4, unconditional) actually
+   re-runs with fresh, meaningful data for `_handle_verifying_harakaat()` to
+   check. `process_chunk_api()` needed no equivalent change — it has no
+   such shortcut; every call already re-decodes fresh via the API.
+
+Not done: no live end-to-end test of the full harakaat-correction loop
+(pause → audio → re-recite → verify) against a real mic session in this
+round.
+
+**2026-08-05 (same day) — two live-display bugs fixed (Claude, chat),
+reported by Hamza from a screenshot: the surah-progress word grid was
+showing large stretches of red on words never actually recited (a garbled
+0.17-confidence chunk followed by a skipped chunk), while earlier ayat
+showed uniform green regardless of what was actually tracked for them.**
+
+Two independent root causes, both in the word-status/coloring path
+(`live_display_formatter.py` / `app.py`), neither related to the harakaat
+work above:
+
+1. `live_display_formatter.py::format_surah_progress_html()` — for any
+   ayah before `current_ayah`, the code unconditionally force-set every
+   word's status to `"correct"`, completely ignoring whatever the real
+   sticky per-word tracker (`self._word_status`) actually recorded for
+   that ayah. The moment the ayah pointer advanced (for any reason,
+   including a bad match), the whole prior ayah displayed green regardless
+   of what actually happened. Fixed: now reads the real tracked status for
+   that ayah if one exists (`self._word_status.get((surah, ayah_num))`);
+   falls back to `"pending"` (the array's own default) only when that ayah
+   was never diffed at all — never claims correctness with nothing behind
+   it.
+2. `app.py::_build_expected_ayah_html()` / `_build_surah_progress_html()`
+   — both fed `session.chunk_results[-1]`'s text into `_update_word_status()`
+   as a real recitation attempt with no reliability check at all. A
+   garbled/low-confidence chunk (verdict `"error"`, confidence 0.17 in
+   Hamza's screenshot) got diffed via `SequenceMatcher` against the ACTUAL
+   reference words, and words it couldn't align cleanly fell into the
+   `"replace"` branch's `"wrong"` default — painting reference words the
+   reciter never even attempted permanently red (that false "wrong" is
+   exactly as sticky as a real one; nothing protected `"pending"` from a
+   bad flip). Fixed: both functions now gate on
+   `last.confidence >= CONFIDENCE_UNCERTAIN_THRESHOLD` (0.30, imported from
+   `live_display_formatter.py`) before using that chunk's text at all.
+   Deliberately confidence-only, NOT verdict-based — a confidently-wrong
+   recitation (high confidence, genuinely wrong words) should still show
+   red; only low-confidence/garbled ASR output is excluded from counting
+   as an attempt.
+
+Not done: didn't add an equivalent confidence gate inside
+`_update_word_status()`/`format_chunk_html()` itself (the per-chunk Chunk
+Details table's own word coloring) — only the two callers that feed the
+surah-progress/expected-ayah panels were touched, since those were the two
+functions Hamza's screenshot actually showed the bug in.
+
+**2026-08-05 (later same day) — doubled-heh text-corruption bug fixed in
+`hybrid_diacritic_pipeline.py` (Claude, chat), reported by Hamza from a
+live bad output at 0.85 confidence (a good decode, corrupted by
+post-processing — not a low-confidence/ASR problem, so the confidence-gate
+fix earlier today wouldn't have caught it).**
+
+`run_hybrid_combination_logic()`'s stage-3 harakaat injection has a
+special-case rule for "ahd"-family words (ihdina, etc.) that rewrites a
+leading alef+kasra artifact from the local model's diacritization into the
+correct alef+heh+sukun prefix. The old code did `prefix + patched[2:]` —
+but `patched[2:]` (everything after the 2-char alef+kasra prefix) already
+starts with the word's own heh (its genuine second letter), so prepending
+a prefix that ALSO supplies a heh duplicated it. This dates back to the
+original Colab draft — the earlier "RULE 1 dead branch" cleanup (§3.1)
+only removed a redundant duplicate condition in this same rule, it didn't
+catch this separate duplication bug underneath it.
+
+Fix: after slicing off the leading alef+kasra, additionally strip the
+now-redundant heh (plus whatever diacritic cluster follows it, matched via
+regex, not assumed to always be sukun) before prepending the corrected
+prefix. No change to the `else` branch (words not starting with "ahd"), no
+change to anything upstream of this one rule.

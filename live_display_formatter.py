@@ -219,6 +219,7 @@ class LiveDisplayFormatter:
         ref_words: List[str],
         recited_words: List[str],
         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
+        word_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> List[str]:
         """Diff this chunk's recited words against the full ayah reference
         and merge the result into the persistent status for (surah, ayah).
@@ -234,6 +235,54 @@ class LiveDisplayFormatter:
         - Words this chunk doesn't touch keep whatever status they already had.
         """
         status = self._get_word_status(surah, ayah, ref_words)
+
+        # The API already returns the authoritative word-by-word alignment.
+        # Prefer it over a second local SequenceMatcher pass: re-aligning
+        # stripped text loses the backend's harakaat/uncertain classifications
+        # and is the reason the Gradio chips could disagree with /transcribe.
+        # A confirmed correct word is intentionally immutable for this live
+        # session; later noisy chunks may never turn a green chip red/gold.
+        if word_errors is not None:
+            harakaat_ref_indexes = {
+                int(error["ref_index"])
+                for error in (harakaat_errors or [])
+                if error.get("ref_index") is not None
+                and str(error.get("ref_index")).lstrip("-").isdigit()
+            }
+            # Explicit backend harakaat errors are the sole gold signal.
+            # Missing diacritics are not in this list and are intentionally
+            # ignored.
+            for ref_index in harakaat_ref_indexes:
+                if 0 <= ref_index < len(status) and status[ref_index] != "correct":
+                    status[ref_index] = "harakaat"
+            for annotation in word_errors:
+                ref_index = annotation.get("ref_index")
+                if ref_index is None:
+                    continue
+                try:
+                    ref_index = int(ref_index)
+                except (TypeError, ValueError):
+                    continue
+                if not 0 <= ref_index < len(status) or status[ref_index] == "correct":
+                    continue
+
+                label = str(annotation.get("status") or "").lower()
+                if label == "correct":
+                    status[ref_index] = (
+                        "harakaat" if ref_index in harakaat_ref_indexes else "correct"
+                    )
+                elif label in ("harakaat_error", "harakaat"):
+                    status[ref_index] = "harakaat"
+                elif label == "minor":
+                    status[ref_index] = "minor"
+                elif label == "uncertain":
+                    status[ref_index] = "wrong"
+                elif label == "major":
+                    # Do not invent errors from uncertain/minor/missing/extra
+                    # API statuses. Only the explicit major status is red.
+                    status[ref_index] = "wrong"
+            return status
+
         if not recited_words:
             return status
 
@@ -267,14 +316,15 @@ class LiveDisplayFormatter:
         for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
                 for j in range(j1, j2):
-                    status[j] = "harakaat" if ref_norm[j] in harakaat_norm_words else "correct"
+                    if status[j] != "correct":
+                        status[j] = "harakaat" if ref_norm[j] in harakaat_norm_words else "correct"
             elif tag == "replace":
                 rec_slice = rec_norm[_i1:_i2]
                 ref_slice = ref_norm[j1:j2]
                 shared = min(len(rec_slice), len(ref_slice))
                 for offset in range(shared):
                     j = j1 + offset
-                    if status[j] in ("correct", "harakaat"):
+                    if status[j] == "correct":
                         continue
                     sim = _char_similarity(rec_slice[offset], ref_slice[offset])
                     status[j] = "correct" if sim >= _WORD_MATCH_THRESHOLD else "wrong"
@@ -287,21 +337,24 @@ class LiveDisplayFormatter:
 
     @staticmethod
     def _render_qari_aligned(ref_words: List[str], status: List[str]) -> List[str]:
-        """Render word spans with qari-style sequential gating: once a word
-        is wrong, no later word may show green/gold until that specific word
-        is fixed (its status flips back to "correct"/"harakaat"). Later words
-        show red (if actually wrong) or gray (if correct but not yet
-        credited)."""
-        frontier = next((i for i, s in enumerate(status) if s == "wrong"), None)
+        """Render each reference word from its own observed status.
+
+        A previous implementation applied a sequential "frontier": after the
+        first wrong word, every later correctly-recognised word was forced
+        gray.  That made the display look as if most of the ayah had not been
+        heard (as in the reported screenshot), even when the ASR had matched
+        those words.  Gray now means only "not yet observed"; green, gold and
+        red always describe that specific word.
+        """
         spans: List[str] = []
         for idx, word in enumerate(ref_words):
             s = status[idx] if idx < len(status) else "pending"
-            if frontier is not None and idx >= frontier and s in ("correct", "harakaat"):
-                color = COLORS["pending"]
-            elif s == "correct":
+            if s == "correct":
                 color = COLORS["correct"]
             elif s == "harakaat":
                 color = COLORS["harakaat"]
+            elif s == "minor":
+                color = COLORS["minor"]
             elif s == "wrong":
                 color = COLORS["major"]
             else:
@@ -320,6 +373,7 @@ class LiveDisplayFormatter:
         current_ayah: int,
         recited_text: str,
         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
+        word_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         if surah is None:
             return self._placeholder_html("Select a surah to view progress.")
@@ -337,15 +391,31 @@ class LiveDisplayFormatter:
             if ayah_num < start_ayah:
                 continue
             if ayah_num < current_ayah:
-                for idx in range(start_idx, end_idx + 1):
-                    all_status[idx] = "correct"
+                # Bug fix (2026-08-05, per Hamza): this used to blanket-mark
+                # every word of any earlier ayah "correct" just because the
+                # session moved past it, ignoring whatever the real tracked
+                # per-word status (self._word_status) said — a word that was
+                # never actually verified could show green here. Now: use
+                # the real tracked status if this ayah was ever diffed at
+                # all; otherwise leave it "pending" (all_status's own
+                # default) rather than claiming correctness with nothing
+                # behind it.
+                tracked = self._word_status.get((int(surah), int(ayah_num)))
+                ayah_len = end_idx - start_idx + 1
+                if tracked and len(tracked) == ayah_len:
+                    for offset, idx in enumerate(range(start_idx, end_idx + 1)):
+                        all_status[idx] = tracked[offset]
                 continue
             if ayah_num > current_ayah:
                 continue
 
             ref_words = raw_words[start_idx:end_idx + 1]
             rec_words = _safe_text(recited_text).split() if recited_text else []
-            status = self._update_word_status(surah, ayah_num, ref_words, rec_words, harakaat_errors=harakaat_errors)
+            status = self._update_word_status(
+                surah, ayah_num, ref_words, rec_words,
+                harakaat_errors=harakaat_errors,
+                word_errors=word_errors,
+            )
             for offset, idx in enumerate(range(start_idx, end_idx + 1)):
                 all_status[idx] = status[offset]
 
@@ -536,6 +606,7 @@ class LiveDisplayFormatter:
         ayah: Optional[int],
         recited_text: str,
         harakaat_errors: Optional[List[Dict[str, Any]]] = None,
+        word_errors: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Render the current ayah, word by word, green/red against the ASR
         text. Always compares against the ACTUAL expected ayah (surah, ayah)
@@ -553,7 +624,11 @@ class LiveDisplayFormatter:
         recited_clean = self._strip_invocations(recited_text, include_basmala=include_basmala)
         rec_words = _safe_text(recited_clean).split()
 
-        status = self._update_word_status(surah, ayah, ref_words, rec_words, harakaat_errors=harakaat_errors)
+        status = self._update_word_status(
+            surah, ayah, ref_words, rec_words,
+            harakaat_errors=harakaat_errors,
+            word_errors=word_errors,
+        )
         spans = self._render_qari_aligned(ref_words, status)
 
         body = " ".join(spans)
